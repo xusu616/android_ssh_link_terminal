@@ -1,0 +1,30 @@
+image: eclipse-temurin:21-jdk
+
+stages:
+  - test
+  - build
+
+variables:
+  GRADLE_USER_HOME: "$CI_PROJECT_DIR/.gradle"
+
+cache:
+  key: "$CI_COMMIT_REF_SLUG"
+  paths:
+    - .gradle/caches
+    - .gradle/wrapper
+
+unit_test:
+  stage: test
+  script:
+    - chmod +x gradlew
+    - ./gradlew testDebugUnitTest --no-daemon
+
+build_debug:
+  stage: build
+  script:
+    - chmod +x gradlew
+    - ./gradlew assembleDebug --no-daemon
+  artifacts:
+    paths:
+      - app/build/outputs/apk/debug/ssh-link-terminal-debug.apk
+    expire_in: 7 days

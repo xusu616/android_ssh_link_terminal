@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="800dp"
+    android:height="600dp"
+    android:viewportWidth="800"
+    android:viewportHeight="600">
+    <!-- Deep Twilight Sky -->
+    <path android:pathData="M0,0h800v600h-800z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="120"
+                android:startY="0"
+                android:endX="720"
+                android:endY="580"
+                android:type="linear">
+                <item android:offset="0" android:color="#0B1026" />
+                <item android:offset="0.45" android:color="#1E1B4B" />
+                <item android:offset="0.82" android:color="#134E4A" />
+                <item android:offset="1" android:color="#0F172A" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Aurora Ribbon Glow -->
+    <path android:pathData="M-40,180 C160,60 360,260 560,120 C680,40 760,90 840,150 L840,340 C680,260 500,360 300,250 C140,170 40,280 -40,250 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="100"
+                android:startY="90"
+                android:endX="680"
+                android:endY="280"
+                android:type="linear">
+                <item android:offset="0" android:color="#552DD4BF" />
+                <item android:offset="0.5" android:color="#66A78BFA" />
+                <item android:offset="1" android:color="#4438BDF8" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Orbital Glow Orb -->
+    <path android:pathData="M560,145 m-75,0 a75,75 0 1,0 150,0 a75,75 0 1,0 -150,0">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:centerX="560"
+                android:centerY="145"
+                android:gradientRadius="75"
+                android:type="radial">
+                <item android:offset="0" android:color="#AAE9D5FF" />
+                <item android:offset="0.6" android:color="#44818CF8" />
+                <item android:offset="1" android:color="#001E1B4B" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Distant Mountain Ridge -->
+    <path
+        android:fillColor="#991E293B"
+        android:pathData="M0,410 L130,305 L270,385 L430,275 L590,370 L720,295 L800,345 L800,600 L0,600 Z" />
+
+    <!-- Mid Ridge with Emerald Rim -->
+    <path
+        android:fillColor="#CC0F172A"
+        android:pathData="M0,460 L190,350 L360,440 L520,330 L690,425 L800,380 L800,600 L0,600 Z" />
+
+    <!-- Foreground Ridge -->
+    <path
+        android:fillColor="#F0090D16"
+        android:pathData="M0,515 L160,445 L330,505 L510,430 L670,495 L800,455 L800,600 L0,600 Z" />
+
+    <!-- Subtle Cyber Grid Dots -->
+    <path
+        android:fillColor="#555EEAD4"
+        android:pathData="M140,110 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0 M260,80 a2,2 0 1,0 4,0 a2,2 0 1,0 -4,0 M420,95 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0 M690,75 a2,2 0 1,0 4,0 a2,2 0 1,0 -4,0 M740,210 a2.5,2.5 0 1,0 5,0 a2.5,2.5 0 1,0 -5,0" />
+</vector>

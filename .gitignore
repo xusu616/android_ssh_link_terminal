@@ -1,0 +1,21 @@
+# Gradle & Build
+.gradle/
+build/
+**/build/
+*.apk
+*.aab
+*.ap_
+*.dex
+.kotlin/
+captures/
+
+# IDE & Local
+.idea/
+*.iml
+local.properties
+.DS_Store
+Thumbs.db
+*.hprof
+*.log
+app/release/output-metadata.json
+app/debug/output-metadata.json

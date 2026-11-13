@@ -1,0 +1,189 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.kotlin.parcelize)
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(libs.versions.java.toolchain.get())
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_21)
+    }
+}
+
+// Release-only version auto-increment (aligned with shizuku-ftp)
+def versionPropsFile = file('version.properties')
+def versionProps = new Properties()
+
+if (versionPropsFile.canRead()) {
+    versionProps.load(new FileInputStream(versionPropsFile))
+} else {
+    throw new GradleException("Could not read version.properties!")
+}
+
+def versionTaskGraph = gradle.taskGraph
+def releaseBuildTask = ~/^(assemble|bundle|package|install|publish)Release(Bundle|Apk)?$/
+def versionLock = new Object()
+def nextVersion = null
+def versionPersisted = false
+
+def isReleaseBuild = {
+    try {
+        return versionTaskGraph.allTasks.any { releaseBuildTask.matcher(it.name).matches() }
+    } catch (Exception ignored) {
+        return false
+    }
+}
+
+def bumpPatch = { String name ->
+    def parts = name?.trim()?.split('\\.')
+    if (parts == null || parts.length < 3 || !(parts[-1] ==~ /\d+/)) {
+        return name
+    }
+    parts[parts.length - 1] = (parts[-1].toInteger() + 1).toString()
+    return parts.join('.')
+}
+
+def resolveVersion = {
+    synchronized (versionLock) {
+        if (nextVersion == null) {
+            nextVersion = [
+                code: versionProps['VERSION_CODE'].toInteger() + 1,
+                name: bumpPatch(versionProps['VERSION_NAME'])
+            ]
+        }
+        if (!versionPersisted && isReleaseBuild()) {
+            versionPersisted = true
+            versionProps['VERSION_CODE'] = nextVersion['code'].toString()
+            versionProps['VERSION_NAME'] = nextVersion['name']
+            versionProps.store(versionPropsFile.newWriter(), null)
+        }
+        return nextVersion
+    }
+}
+
+android {
+    namespace = "com.xusu.sshlinkterminal"
+    compileSdk = libs.versions.compileSdk.get().toInteger()
+    buildToolsVersion = "36.0.0"
+
+    defaultConfig {
+        applicationId = "com.xusu.sshlinkterminal"
+        versionCode = versionProps['VERSION_CODE'].toInteger()
+        versionName = versionProps['VERSION_NAME']
+
+        minSdk = libs.versions.minSdk.get().toInteger()
+        targetSdk = libs.versions.targetSdk.get().toInteger()
+    }
+
+    buildTypes {
+        debug {
+            debuggable = true
+            minifyEnabled = false
+            shrinkResources = false
+            applicationIdSuffix = ".debug"
+        }
+        release {
+            minifyEnabled = true
+            shrinkResources = true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    buildFeatures {
+        compose = true
+        aidl = true
+        buildConfig = true
+    }
+
+    packaging {
+        resources {
+            excludes += [
+                'META-INF/LICENSE',
+                'META-INF/LICENSE.txt',
+                'META-INF/NOTICE',
+                'META-INF/NOTICE.txt',
+                'META-INF/DEPENDENCIES',
+                'META-INF/versions/9/OSGI-INF/MANIFEST.MF',
+                'META-INF/BCKEY.SF',
+                'META-INF/BCKEY.DSA',
+                'META-INF/BCKEY.RSA'
+            ]
+        }
+    }
+
+    lint {
+        abortOnError = false
+    }
+
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+}
+
+androidComponents {
+    onVariants(selector().withBuildType('release')) { variant ->
+        variant.outputs.forEach { output ->
+            output.versionCode.set(providers.provider { resolveVersion()['code'] })
+            output.versionName.set(providers.provider { resolveVersion()['name'] })
+        }
+    }
+    onVariants(selector().all()) { variant ->
+        variant.outputs.forEach { output ->
+            output.outputFileName.set("ssh-link-terminal-${variant.buildType}.apk")
+        }
+    }
+}
+
+dependencies {
+    implementation libs.androidx.core.ktx
+    implementation libs.androidx.activity.compose
+    implementation libs.androidx.browser
+    implementation libs.androidx.lifecycle.runtime.compose
+    implementation libs.androidx.lifecycle.viewmodel.compose
+    implementation libs.androidx.navigation.compose
+    implementation libs.androidx.palette.ktx
+    implementation libs.google.material
+
+    implementation platform(libs.androidx.compose.bom)
+    implementation libs.androidx.ui
+    implementation libs.androidx.ui.graphics
+    implementation libs.androidx.foundation
+    implementation libs.androidx.runtime
+    implementation libs.androidx.material3
+    implementation libs.androidx.ui.tooling.preview
+    implementation libs.androidx.compose.animation.graphics
+    implementation libs.androidx.compose.material.icons.extended
+    debugImplementation libs.androidx.ui.tooling
+    debugImplementation libs.androidx.ui.test.manifest
+
+    implementation libs.haze
+    implementation libs.haze.blur
+    implementation libs.haze.blur.materials
+    implementation libs.vico.compose.m3
+
+    implementation libs.shizuku.api
+    implementation libs.shizuku.provider
+
+    implementation libs.kotlinx.coroutines.android
+    implementation libs.mwiede.jsch
+    implementation libs.bouncycastle.bcprov
+    implementation libs.bouncycastle.bcpkix
+
+    testImplementation libs.junit
+    testImplementation libs.kotlinx.coroutines.test
+    testImplementation libs.org.json
+}
