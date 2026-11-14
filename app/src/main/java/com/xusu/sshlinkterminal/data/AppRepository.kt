@@ -94,8 +94,13 @@ class AppRepository(context: Context) {
 
     fun appendRttSample(rttMs: Long, activeSessions: Int) {
         val nowSec = System.currentTimeMillis() / 1000L
-        val next = (_rttSamples.value + RttSample(nowSec, rttMs.coerceAtLeast(0L), activeSessions))
-            .takeLast(120)
+        val sample = RttSample(nowSec, rttMs.coerceAtLeast(0L), activeSessions)
+        val current = _rttSamples.value
+        val next = if (current.lastOrNull()?.timestampSec == nowSec) {
+            current.dropLast(1) + sample
+        } else {
+            (current + sample).takeLast(720)
+        }
         _rttSamples.value = next
     }
 
@@ -108,11 +113,18 @@ class AppRepository(context: Context) {
         _logs.value = emptyList()
     }
 
+    fun hasPromptedShizukuPermission(): Boolean =
+        prefs.getBoolean(KEY_SHIZUKU_PROMPTED, false)
+
+    fun markShizukuPermissionPrompted() {
+        prefs.edit { putBoolean(KEY_SHIZUKU_PROMPTED, true) }
+    }
+
     private fun loadHosts(): List<HostProfile> {
         val raw = prefs.getString(KEY_HOSTS, null) ?: return defaultHosts()
         return try {
             val arr = JSONArray(raw)
-            (0 until arr.length()).map { i ->
+            val parsed = (0 until arr.length()).map { i ->
                 val obj = arr.getJSONObject(i)
                 HostProfile(
                     id = obj.getString("id"),
@@ -130,6 +142,24 @@ class AppRepository(context: Context) {
                     pinInDaemon = obj.optBoolean("pinInDaemon", true),
                     tag = obj.optString("tag", "LAN")
                 )
+            }
+            if (!prefs.getBoolean(KEY_MIGRATED_LEGACY_TMUX_V1, false)) {
+                var changed = false
+                val cleaned = parsed.map { host ->
+                    if (host.autoAttachCommand.trim() == LEGACY_AUTO_ATTACH_CMD) {
+                        changed = true
+                        host.copy(autoAttachCommand = "")
+                    } else {
+                        host
+                    }
+                }
+                if (changed) {
+                    saveHosts(cleaned)
+                }
+                prefs.edit { putBoolean(KEY_MIGRATED_LEGACY_TMUX_V1, true) }
+                cleaned
+            } else {
+                parsed
             }
         } catch (_: Exception) {
             defaultHosts()
@@ -243,7 +273,13 @@ class AppRepository(context: Context) {
             wallpaperUri = prefs.getString("ui_wallpaper_uri", null),
             blurRadius = prefs.getFloat("ui_blur_radius", 18f),
             terminalScrimAlpha = prefs.getFloat("ui_terminal_scrim", 0.72f),
-            terminalFontSizeSp = prefs.getFloat("ui_terminal_font_sp", 13.5f),
+            terminalFontSizeSp = prefs.getFloat("ui_terminal_font_sp", 11.5f),
+            terminalUseMonospace = prefs.getBoolean("ui_terminal_use_mono", true),
+            terminalFontPreset = prefs.getString("ui_terminal_font_preset", "AUTO") ?: "AUTO",
+            terminalCustomFontPath = prefs.getString("ui_terminal_custom_font_path", null),
+            terminalCustomFontName = prefs.getString("ui_terminal_custom_font_name", null),
+            terminalHorizontalScroll = prefs.getBoolean("ui_terminal_hscroll", true),
+            accentDepth = prefs.getFloat("ui_accent_depth", 0.28f),
             autoOpenOAuthUrl = prefs.getBoolean("ui_auto_open_oauth", true),
             springAnimation = prefs.getBoolean("ui_spring_anim", true),
             hapticFeedback = prefs.getBoolean("ui_haptic", true),
@@ -261,6 +297,12 @@ class AppRepository(context: Context) {
             putFloat("ui_blur_radius", value.blurRadius)
             putFloat("ui_terminal_scrim", value.terminalScrimAlpha)
             putFloat("ui_terminal_font_sp", value.terminalFontSizeSp)
+            putBoolean("ui_terminal_use_mono", value.terminalUseMonospace)
+            putString("ui_terminal_font_preset", value.terminalFontPreset)
+            putString("ui_terminal_custom_font_path", value.terminalCustomFontPath)
+            putString("ui_terminal_custom_font_name", value.terminalCustomFontName)
+            putBoolean("ui_terminal_hscroll", value.terminalHorizontalScroll)
+            putFloat("ui_accent_depth", value.accentDepth)
             putBoolean("ui_auto_open_oauth", value.autoOpenOAuthUrl)
             putBoolean("ui_spring_anim", value.springAnimation)
             putBoolean("ui_haptic", value.hapticFeedback)
@@ -278,7 +320,7 @@ class AppRepository(context: Context) {
             port = 22,
             username = "root",
             authType = AuthType.PASSWORD,
-            autoAttachCommand = "tmux new-session -A -s main || true",
+            autoAttachCommand = "",
             keepAliveIntervalSec = 15,
             autoReconnect = true,
             pinInDaemon = true,
@@ -291,7 +333,7 @@ class AppRepository(context: Context) {
             port = 22,
             username = "root",
             authType = AuthType.INTERACTIVE_OR_TAILSCALE,
-            autoAttachCommand = "tmux new-session -A -s main || true",
+            autoAttachCommand = "",
             keepAliveIntervalSec = 15,
             autoReconnect = true,
             pinInDaemon = true,
@@ -315,5 +357,8 @@ class AppRepository(context: Context) {
         private const val KEY_HOSTS = "hosts_json"
         private const val KEY_KEYS = "keys_json"
         private const val KEY_MACROS = "macros_json"
+        private const val KEY_SHIZUKU_PROMPTED = "shizuku_permission_prompted"
+        private const val KEY_MIGRATED_LEGACY_TMUX_V1 = "migrated_legacy_tmux_v1"
+        private const val LEGACY_AUTO_ATTACH_CMD = "tmux new-session -A -s main || true"
     }
 }

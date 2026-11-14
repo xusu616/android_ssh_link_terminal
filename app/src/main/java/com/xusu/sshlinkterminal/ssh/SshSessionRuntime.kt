@@ -7,6 +7,7 @@ import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.UIKeyboardInteractive
 import com.jcraft.jsch.UserInfo
+import com.xusu.sshlinkterminal.LinkTerminalApp
 import com.xusu.sshlinkterminal.crypto.SshKeyManager
 import com.xusu.sshlinkterminal.crypto.VaultCrypto
 import com.xusu.sshlinkterminal.data.AppRepository
@@ -114,9 +115,12 @@ class SshSessionController(
     }
 
     fun connect(forceRestart: Boolean = false) {
-        if (!forceRestart && (_snapshot.value.state == SessionState.CONNECTED ||
-                _snapshot.value.state == SessionState.CONNECTING ||
-                _snapshot.value.state == SessionState.AWAITING_OAUTH)
+        val currentState = _snapshot.value.state
+        if (!forceRestart && (currentState == SessionState.CONNECTED ||
+                currentState == SessionState.CONNECTING ||
+                currentState == SessionState.RECONNECTING ||
+                currentState == SessionState.AWAITING_INPUT ||
+                currentState == SessionState.AWAITING_OAUTH)
         ) {
             return
         }
@@ -294,8 +298,8 @@ class SshSessionController(
         }
         val aliveSec = host.keepAliveIntervalSec.coerceIn(5, 120)
         session.setServerAliveInterval(aliveSec * 1000)
-        session.setServerAliveCountMax(4)
-        session.timeout = 20_000
+        session.setServerAliveCountMax(8)
+        session.timeout = maxOf(aliveSec * 1000, 25_000)
 
         session.userInfo = createSshUserInfo(host, savedPassword)
 
@@ -567,7 +571,8 @@ class SshSessionManager(
 
     private val autoOpenCallback: (String) -> Unit = { url ->
         scope.launch {
-            LinkDetector.openUrlInBrowser(appContext, url)
+            val launchContext = (appContext as? LinkTerminalApp)?.currentResumedActivity() ?: appContext
+            LinkDetector.openUrlInBrowser(launchContext, url)
         }
     }
 
@@ -623,6 +628,12 @@ class SshSessionManager(
             .forEach { host ->
                 getOrCreateController(host).connect()
             }
+    }
+
+    fun connectAll() {
+        repository.hosts.value.forEach { host ->
+            getOrCreateController(host).connect()
+        }
     }
 
     fun onNetworkAvailable() {

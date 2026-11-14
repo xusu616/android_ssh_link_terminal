@@ -43,4 +43,31 @@ class AnsiEmulatorTest {
         emulator.feedText("\u001B[?1049l")
         assertEquals("primary-line", emulator.snapshotLines()[0].plainText)
     }
+
+    @Test
+    fun `shrinking primary screen height preserves bottom prompt via scrollback`() {
+        val emulator = AnsiEmulator(initialCols = 40, initialRows = 8)
+        for (i in 1..6) {
+            emulator.feedText("line-$i\r\n")
+        }
+        emulator.feedText("Enter code: ")
+
+        // Shrink viewport height (e.g. OAuth banner or IME opened)
+        emulator.resize(40, 4)
+
+        val lines = emulator.snapshotLines().map { it.plainText }
+        assertTrue("Expected earlier scrollback lines preserved: $lines", lines.contains("line-1"))
+        assertTrue("Expected bottom prompt preserved instead of clipped: $lines", lines.any { it.contains("Enter code:") })
+    }
+
+    @Test
+    fun `handles mixed ASCII and CJK wide characters cleanly`() {
+        val emulator = AnsiEmulator(initialCols = 20, initialRows = 4)
+        assertTrue(AnsiEmulator.isWideChar('中'))
+        emulator.feedText("AB中文CD")
+
+        val lines = emulator.snapshotLines()
+        assertEquals(1, lines.size)
+        assertEquals("AB中文CD", lines[0].plainText)
+    }
 }

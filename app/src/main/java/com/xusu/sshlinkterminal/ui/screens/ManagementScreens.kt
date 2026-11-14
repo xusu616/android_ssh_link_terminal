@@ -1,11 +1,13 @@
 package com.xusu.sshlinkterminal.ui.screens
 
 import android.content.Intent
+import android.graphics.Typeface
 import android.net.Uri
 import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,6 +36,7 @@ import androidx.compose.material.icons.rounded.Edit
 import androidx.compose.material.icons.rounded.Image
 import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.UploadFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -42,6 +45,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -76,6 +80,7 @@ import androidx.compose.ui.unit.sp
 import com.xusu.sshlinkterminal.BuildConfig
 import com.xusu.sshlinkterminal.crypto.SshKeyManager
 import com.xusu.sshlinkterminal.data.AppLogEntry
+import com.xusu.sshlinkterminal.data.GuardStatus
 import com.xusu.sshlinkterminal.data.MacroButton
 import com.xusu.sshlinkterminal.data.MacroCategory
 import com.xusu.sshlinkterminal.data.SshKeyRecord
@@ -84,6 +89,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
@@ -473,10 +479,14 @@ fun MacroEditDialog(
 @Composable
 fun AppearanceSettingsScreen(
     prefs: UiPreferences,
+    guardStatus: GuardStatus,
     onBack: () -> Unit,
     onUpdatePrefs: ((UiPreferences) -> UiPreferences) -> Unit,
     onPickWallpaper: () -> Unit,
-    onResetWallpaper: () -> Unit
+    onResetWallpaper: () -> Unit,
+    onPickTerminalFont: () -> Unit,
+    onRequestShizuku: () -> Unit,
+    onApplyShizukuHarden: () -> Unit
 ) {
     Scaffold(
         topBar = {
@@ -521,6 +531,28 @@ fun AppearanceSettingsScreen(
                 checked = prefs.useM3Color,
                 onCheckedChange = { checked -> onUpdatePrefs { it.copy(useM3Color = checked) } }
             )
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Text(
+                    text = "壁纸取色加深深度: ${(prefs.accentDepth * 100).toInt()}%",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = if (prefs.useM3Color) {
+                        "当前处于系统 M3 动态取色；关闭上方开关后生效（源码: ThemeEngine.kt -> deepenExtractedAccent）"
+                    } else {
+                        "保留壁纸原色相并加深饱和质感（源码: ThemeEngine.kt -> deepenExtractedAccent）"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Slider(
+                    value = prefs.accentDepth.coerceIn(0f, 0.70f),
+                    onValueChange = { v -> onUpdatePrefs { it.copy(accentDepth = v) } },
+                    valueRange = 0f..0.70f,
+                    enabled = !prefs.useM3Color
+                )
+            }
             PrefSwitchRow(
                 title = "检测到 OAuth / Tailscale 链接自动打开浏览器",
                 subtitle = "识别 login.tailscale.com、Google/Antigravity OAuth 时自动唤起 Custom Tabs",
@@ -533,6 +565,72 @@ fun AppearanceSettingsScreen(
                 checked = prefs.autoHardenWithShizuku,
                 onCheckedChange = { checked -> onUpdatePrefs { it.copy(autoHardenWithShizuku = checked) } }
             )
+
+            // Shizuku Optional Permission & Status Card
+            val shizukuStatusLabel = when {
+                !guardStatus.shizukuInstalled -> "未安装 Shizuku（可选，不影响基础 SSH）"
+                !guardStatus.shizukuRunning -> "Shizuku 已安装，但服务尚未启动"
+                !guardStatus.shizukuPermissionGranted -> "Shizuku 运行中，尚未授予本应用权限"
+                else -> "Shizuku 已授权（看门狗: ${if (guardStatus.watchdogActive) "运行中" else "待激活"}）"
+            }
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Security,
+                            contentDescription = null,
+                            tint = if (guardStatus.shizukuPermissionGranted) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            }
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Shizuku 权限与后台加固", fontWeight = FontWeight.SemiBold)
+                            Text(
+                                text = shizukuStatusLabel,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    Text(
+                        text = "不使用 Shizuku 也能正常连接与使用终端；授权后可额外启用 Doze 白名单、Standby Active 与进程看门狗。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        when {
+                            guardStatus.shizukuRunning && !guardStatus.shizukuPermissionGranted -> {
+                                Button(onClick = onRequestShizuku) {
+                                    Text("请求 Shizuku 授权")
+                                }
+                            }
+                            guardStatus.shizukuPermissionGranted -> {
+                                FilledTonalButton(onClick = onApplyShizukuHarden) {
+                                    Text("立即执行防杀加固")
+                                }
+                            }
+                            else -> {
+                                OutlinedButton(onClick = onRequestShizuku) {
+                                    Text("检测 / 请求 Shizuku 授权")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             PrefSwitchRow(
                 title = "开机自启恢复常驻守护主机",
                 subtitle = "收到 BOOT_COMPLETED 后自动恢复勾选常驻的主机连接",
@@ -554,6 +652,126 @@ fun AppearanceSettingsScreen(
 
             HorizontalDivider()
 
+            // Terminal Typography & Viewport Card
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.48f))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text("终端字体与排版", fontWeight = FontWeight.Bold)
+                    PrefSwitchRow(
+                        title = "终端使用等宽字体",
+                        subtitle = "开启后按等宽网格对齐 ASCII 图形；关闭则使用系统默认字体自然排版",
+                        checked = prefs.terminalUseMonospace,
+                        onCheckedChange = { checked -> onUpdatePrefs { it.copy(terminalUseMonospace = checked) } }
+                    )
+                    if (prefs.terminalUseMonospace) {
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            FilterChip(
+                                selected = prefs.terminalFontPreset == "AUTO",
+                                onClick = { onUpdatePrefs { it.copy(terminalFontPreset = "AUTO") } },
+                                label = { Text("系统真实等宽") }
+                            )
+                            FilterChip(
+                                selected = prefs.terminalFontPreset == "SYSTEM_MONO",
+                                onClick = { onUpdatePrefs { it.copy(terminalFontPreset = "SYSTEM_MONO") } },
+                                label = { Text("系统 Monospace") }
+                            )
+                            if (prefs.terminalCustomFontPath != null) {
+                                FilterChip(
+                                    selected = prefs.terminalFontPreset == "CUSTOM",
+                                    onClick = { onUpdatePrefs { it.copy(terminalFontPreset = "CUSTOM") } },
+                                    label = { Text(prefs.terminalCustomFontName ?: "自定义字体") }
+                                )
+                            }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            FilledTonalButton(onClick = onPickTerminalFont) {
+                                Icon(Icons.Rounded.UploadFile, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("选择自定义等宽字体 (.ttf/.otf)")
+                            }
+                            val customPath = prefs.terminalCustomFontPath
+                            if (customPath != null) {
+                                OutlinedButton(
+                                    onClick = {
+                                        runCatching { File(customPath).delete() }
+                                        onUpdatePrefs {
+                                            it.copy(
+                                                terminalFontPreset = "AUTO",
+                                                terminalCustomFontPath = null,
+                                                terminalCustomFontName = null
+                                            )
+                                        }
+                                    }
+                                ) {
+                                    Text("移除")
+                                }
+                            }
+                        }
+                    }
+
+                    val previewFamily = remember(
+                        prefs.terminalUseMonospace,
+                        prefs.terminalFontPreset,
+                        prefs.terminalCustomFontPath
+                    ) {
+                        when {
+                            !prefs.terminalUseMonospace -> FontFamily.Default
+                            prefs.terminalFontPreset == "CUSTOM" && prefs.terminalCustomFontPath != null -> {
+                                runCatching {
+                                    FontFamily(Typeface.createFromFile(File(prefs.terminalCustomFontPath)))
+                                }.getOrDefault(FontFamily.Monospace)
+                            }
+                            else -> FontFamily.Monospace
+                        }
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = Color(0xFF090D16)
+                    ) {
+                        Text(
+                            text = "Windows PowerShell | 192.168.1.222 | 中文对齐 1234",
+                            color = Color(0xFFE2E8F0),
+                            fontFamily = previewFamily,
+                            fontSize = prefs.terminalFontSizeSp.coerceIn(8f, 22f).sp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 10.dp, vertical = 8.dp)
+                        )
+                    }
+
+                    PrefSwitchRow(
+                        title = "终端允许左右横向滚动",
+                        subtitle = "开启后保持至少 80 列不折行挤压，长命令行可直接左右滑动",
+                        checked = prefs.terminalHorizontalScroll,
+                        onCheckedChange = { checked -> onUpdatePrefs { it.copy(terminalHorizontalScroll = checked) } }
+                    )
+
+                    Text(
+                        text = "终端默认字号: ${String.format(Locale.US, "%.1f", prefs.terminalFontSizeSp)} sp",
+                        style = MaterialTheme.typography.titleSmall
+                    )
+                    Slider(
+                        value = prefs.terminalFontSizeSp.coerceIn(8f, 22f),
+                        onValueChange = { v ->
+                            val snapped = ((v * 2f).toInt() / 2f).coerceIn(8f, 22f)
+                            onUpdatePrefs { it.copy(terminalFontSizeSp = snapped) }
+                        },
+                        valueRange = 8f..22f,
+                        steps = 27
+                    )
+                }
+            }
+
             Text("Haze 毛玻璃模糊半径: ${prefs.blurRadius.toInt()} dp", style = MaterialTheme.typography.titleSmall)
             Slider(
                 value = prefs.blurRadius,
@@ -566,13 +784,6 @@ fun AppearanceSettingsScreen(
                 value = prefs.terminalScrimAlpha,
                 onValueChange = { v -> onUpdatePrefs { it.copy(terminalScrimAlpha = v) } },
                 valueRange = 0.45f..0.95f
-            )
-
-            Text("终端默认字号: ${prefs.terminalFontSizeSp.toInt()} sp", style = MaterialTheme.typography.titleSmall)
-            Slider(
-                value = prefs.terminalFontSizeSp,
-                onValueChange = { v -> onUpdatePrefs { it.copy(terminalFontSizeSp = v) } },
-                valueRange = 10f..22f
             )
         }
     }

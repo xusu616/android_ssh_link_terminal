@@ -27,7 +27,8 @@ data class TerminalRenderLine(
 private data class Cell(
     var ch: Char = ' ',
     var style: TerminalStyle = TerminalStyle(),
-    var oscLink: String? = null
+    var oscLink: String? = null,
+    var isWideTrail: Boolean = false
 )
 
 /**
@@ -80,13 +81,41 @@ class AnsiEmulator(
         val targetRows = newRows.coerceIn(8, 120)
         if (targetCols == cols && targetRows == rows) return@synchronized
 
-        primaryScreen = resizeGrid(primaryScreen, targetRows, targetCols)
-        altScreen = resizeGrid(altScreen, targetRows, targetCols)
+        val primaryAnchorRow = if (usingAltScreen) savedCursorRow else cursorRow
+        val primaryContentBottom = maxOf(primaryAnchorRow, findLastNonBlankRow(primaryScreen))
+        val primaryDrop = if (targetRows < rows && primaryContentBottom >= targetRows) {
+            (primaryContentBottom - (targetRows - 1)).coerceIn(0, rows - targetRows)
+        } else {
+            0
+        }
+        if (primaryDrop > 0) {
+            for (r in 0 until primaryDrop) {
+                if (scrollback.size >= maxScrollback) {
+                    scrollback.removeFirst()
+                }
+                scrollback.addLast(Array(cols) { idx -> primaryScreen[r][idx].copy() })
+            }
+        }
+        primaryScreen = resizeGrid(primaryScreen, targetRows, targetCols, startRow = primaryDrop)
+
+        val altDrop = if (usingAltScreen && targetRows < rows && cursorRow >= targetRows) {
+            (cursorRow - (targetRows - 1)).coerceIn(0, rows - targetRows)
+        } else {
+            0
+        }
+        altScreen = resizeGrid(altScreen, targetRows, targetCols, startRow = altDrop)
+
         cols = targetCols
         rows = targetRows
         scrollTop = 0
         scrollBottom = rows - 1
-        cursorRow = cursorRow.coerceIn(0, rows - 1)
+        if (usingAltScreen) {
+            savedCursorRow = (savedCursorRow - primaryDrop).coerceIn(0, rows - 1)
+            savedCursorCol = savedCursorCol.coerceIn(0, cols - 1)
+            cursorRow = (cursorRow - altDrop).coerceIn(0, rows - 1)
+        } else {
+            cursorRow = (cursorRow - primaryDrop).coerceIn(0, rows - 1)
+        }
         cursorCol = cursorCol.coerceIn(0, cols - 1)
     }
 
@@ -154,13 +183,31 @@ class AnsiEmulator(
     private fun createScreen(rCount: Int, cCount: Int): Array<Array<Cell>> =
         Array(rCount) { Array(cCount) { Cell() } }
 
-    private fun resizeGrid(old: Array<Array<Cell>>, newRows: Int, newCols: Int): Array<Array<Cell>> {
+    private fun findLastNonBlankRow(screen: Array<Array<Cell>>): Int {
+        var r = screen.lastIndex
+        while (r > 0 && isBlankRow(screen[r])) {
+            r--
+        }
+        return r
+    }
+
+    private fun resizeGrid(
+        old: Array<Array<Cell>>,
+        newRows: Int,
+        newCols: Int,
+        startRow: Int = 0
+    ): Array<Array<Cell>> {
         val next = createScreen(newRows, newCols)
-        val copyRows = minOf(old.size, newRows)
+        val availableRows = (old.size - startRow).coerceAtLeast(0)
+        val copyRows = minOf(availableRows, newRows)
         for (r in 0 until copyRows) {
-            val copyCols = minOf(old[r].size, newCols)
+            val srcRow = old[startRow + r]
+            val copyCols = minOf(srcRow.size, newCols)
             for (c in 0 until copyCols) {
-                next[r][c] = old[r][c].copy()
+                next[r][c] = srcRow[c].copy()
+            }
+            if (newCols in 1..<srcRow.size && next[r][newCols - 1].isWideTrail) {
+                next[r][newCols - 1] = Cell()
             }
         }
         return next
@@ -243,13 +290,28 @@ class AnsiEmulator(
     }
 
     private fun putChar(ch: Char) {
-        if (cursorCol >= cols) {
+        val wide = isWideChar(ch)
+        if (wide && cursorCol >= cols - 1) {
+            if (cursorCol < cols) {
+                activeScreen()[cursorRow][cursorCol] = Cell()
+            }
+            cursorCol = 0
+            lineFeed()
+        } else if (cursorCol >= cols) {
             cursorCol = 0
             lineFeed()
         }
         val row = activeScreen()[cursorRow]
-        row[cursorCol] = Cell(ch = ch, style = currentStyle, oscLink = currentOscLink)
-        cursorCol++
+        if (row[cursorCol].isWideTrail && cursorCol > 0) {
+            row[cursorCol - 1] = Cell()
+        }
+        row[cursorCol] = Cell(ch = ch, style = currentStyle, oscLink = currentOscLink, isWideTrail = false)
+        if (wide && cursorCol + 1 < cols) {
+            row[cursorCol + 1] = Cell(ch = '\u0000', style = currentStyle, oscLink = currentOscLink, isWideTrail = true)
+            cursorCol += 2
+        } else {
+            cursorCol++
+        }
     }
 
     private fun lineFeed() {
@@ -513,46 +575,69 @@ class AnsiEmulator(
     }
 
     private fun isBlankRow(row: Array<Cell>): Boolean =
-        row.all { it.ch == ' ' && it.style.bgRgb == null && !it.style.inverse }
+        row.all { !it.isWideTrail && it.ch == ' ' && it.style.bgRgb == null && !it.style.inverse }
 
     private fun rowToRenderLine(row: Array<Cell>): TerminalRenderLine {
         var lastCol = row.lastIndex
-        while (lastCol >= 0 && row[lastCol].ch == ' ' && row[lastCol].style.bgRgb == null && !row[lastCol].style.inverse) {
+        while (lastCol >= 0 && !row[lastCol].isWideTrail && row[lastCol].ch == ' ' &&
+            row[lastCol].style.bgRgb == null && !row[lastCol].style.inverse
+        ) {
             lastCol--
         }
         if (lastCol < 0) return TerminalRenderLine(emptyList(), "")
 
-        val sb = StringBuilder(lastCol + 1)
+        val visibleCells = ArrayList<Cell>(lastCol + 1)
         for (c in 0..lastCol) {
-            sb.append(row[c].ch)
+            val cell = row[c]
+            if (!cell.isWideTrail) {
+                visibleCells.add(cell)
+            }
+        }
+        if (visibleCells.isEmpty()) return TerminalRenderLine(emptyList(), "")
+
+        val sb = StringBuilder(visibleCells.size)
+        for (cell in visibleCells) {
+            sb.append(cell.ch)
         }
         val plain = sb.toString()
         val detectedLinks = LinkDetector.extractUrls(plain)
 
-        fun linkAt(col: Int): String? {
-            row[col].oscLink?.let { return it }
-            return detectedLinks.firstOrNull { col in it.startIndex until it.endIndexExclusive }?.url
+        fun linkAt(index: Int): String? {
+            visibleCells[index].oscLink?.let { return it }
+            return detectedLinks.firstOrNull { index in it.startIndex until it.endIndexExclusive }?.url
         }
 
         val spans = mutableListOf<TerminalSpan>()
         var runStart = 0
-        var runStyle = row[0].style
+        var runStyle = visibleCells[0].style
         var runLink = linkAt(0)
-        for (c in 1..lastCol) {
-            val st = row[c].style
-            val lk = linkAt(c)
+        for (idx in 1 until visibleCells.size) {
+            val st = visibleCells[idx].style
+            val lk = linkAt(idx)
             if (st != runStyle || lk != runLink) {
-                spans.add(TerminalSpan(plain.substring(runStart, c), runStyle, runLink))
-                runStart = c
+                spans.add(TerminalSpan(plain.substring(runStart, idx), runStyle, runLink))
+                runStart = idx
                 runStyle = st
                 runLink = lk
             }
         }
-        spans.add(TerminalSpan(plain.substring(runStart, lastCol + 1), runStyle, runLink))
+        spans.add(TerminalSpan(plain.substring(runStart, visibleCells.size), runStyle, runLink))
         return TerminalRenderLine(spans = spans, plainText = plain)
     }
 
     companion object {
+        fun isWideChar(ch: Char): Boolean {
+            val code = ch.code
+            return code in 0x1100..0x115F ||
+                code in 0x2E80..0x303E ||
+                code in 0x3040..0xA4CF ||
+                code in 0xAC00..0xD7A3 ||
+                code in 0xF900..0xFAFF ||
+                code in 0xFE10..0xFE19 ||
+                code in 0xFE30..0xFE6F ||
+                code in 0xFF01..0xFF60 ||
+                code in 0xFFE0..0xFFE6
+        }
         private val ANSI_16_COLORS = intArrayOf(
             0xFF1E293B.toInt(), // Black
             0xFFF87171.toInt(), // Red

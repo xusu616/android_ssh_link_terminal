@@ -12,6 +12,7 @@ import android.os.PowerManager
 import androidx.core.content.ContextCompat
 import com.xusu.sshlinkterminal.data.AppRepository
 import com.xusu.sshlinkterminal.data.GuardStatus
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -20,6 +21,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import rikka.shizuku.Shizuku
 
@@ -42,6 +44,9 @@ class ShizukuManager(
     @Volatile
     private var foregroundRunningFlag = false
 
+    @Volatile
+    private var pendingBindWaiter: CompletableDeferred<IShizukuDaemonService?>? = null
+
     private val serviceArgs: Shizuku.UserServiceArgs by lazy {
         val debuggable = (appContext.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
         Shizuku.UserServiceArgs(
@@ -55,8 +60,11 @@ class ShizukuManager(
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            daemonService = IShizukuDaemonService.Stub.asInterface(service)
-            isBound = daemonService != null
+            val svc = IShizukuDaemonService.Stub.asInterface(service)
+            daemonService = svc
+            isBound = svc != null
+            pendingBindWaiter?.complete(svc)
+            pendingBindWaiter = null
             repository.appendLog("INFO", "Shizuku", "Shizuku 守护服务已连接 (daemon=true)")
             scope.launch {
                 if (repository.uiPreferences.value.autoHardenWithShizuku) {
@@ -70,6 +78,8 @@ class ShizukuManager(
         override fun onServiceDisconnected(name: ComponentName?) {
             daemonService = null
             isBound = false
+            pendingBindWaiter?.complete(null)
+            pendingBindWaiter = null
             repository.appendLog("WARN", "Shizuku", "Shizuku 守护服务连接断开")
             scope.launch { refreshStatus() }
         }
@@ -190,30 +200,44 @@ class ShizukuManager(
         _guardStatus.value = _guardStatus.value.copy(watchdogActive = false)
     }
 
+    private suspend fun ensureDaemonService(timeoutMs: Long = 4_000L): IShizukuDaemonService? {
+        daemonService?.let { return it }
+        if (!isShizukuPermissionGranted()) return null
+        val waiter = CompletableDeferred<IShizukuDaemonService?>()
+        pendingBindWaiter = waiter
+        bindDaemonService()
+        return withTimeoutOrNull(timeoutMs) { waiter.await() } ?: daemonService
+    }
+
     suspend fun applyHardeningAndWatchdog(silent: Boolean = false): GuardStatus = withContext(Dispatchers.IO) {
         if (!isShizukuPermissionGranted()) {
-            return@withContext refreshStatus()
+            val status = refreshStatus()
+            return@withContext status.copy(lastReport = "请先授予 Shizuku 权限后再执行加固")
         }
-        if (daemonService == null) {
-            bindDaemonService()
-            return@withContext refreshStatus()
+        val svc = ensureDaemonService()
+        if (svc == null) {
+            val status = refreshStatus()
+            return@withContext status.copy(lastReport = "Shizuku Daemon 尚未连接成功，请稍等或重启 Shizuku 后重试")
         }
         try {
-            val rawReport = daemonService?.applyKeepAliveHardening(appContext.packageName) ?: "{}"
+            val rawReport = svc.applyKeepAliveHardening(appContext.packageName) ?: "{}"
             val serviceClass = "com.xusu.sshlinkterminal.service.TerminalForegroundService"
-            daemonService?.startWatchdog(appContext.packageName, serviceClass)
+            svc.startWatchdog(appContext.packageName, serviceClass)
             val json = JSONObject(rawReport)
             val ok = json.optBoolean("ok", false)
             if (!silent) {
                 repository.appendLog(
                     if (ok) "INFO" else "WARN",
                     "Shizuku",
-                    if (ok) "Doze 白名单、Standby Active、AppOps 放行与守护看门狗已全部启用"
+                    if (ok) "Doze 白名单、Standby、AppOps 放行与守护看门狗已全部启用"
                     else "部分加固命令返回非零: $rawReport"
                 )
             }
         } catch (t: Throwable) {
+            daemonService = null
+            isBound = false
             repository.appendLog("ERROR", "Shizuku", "执行 Shizuku 加固失败: ${t.message}")
+            return@withContext refreshStatus().copy(lastReport = "执行 Shizuku 加固异常: ${t.message}")
         }
         refreshStatus()
     }
@@ -237,16 +261,23 @@ class ShizukuManager(
         var watchdogActive = false
         var reportSummary = ""
 
-        if (permGranted && daemonService != null) {
+        val svc = daemonService
+        if (permGranted && svc != null) {
             try {
-                val raw = daemonService?.queryHardeningStatus(appContext.packageName) ?: "{}"
+                val raw = svc.queryHardeningStatus(appContext.packageName) ?: "{}"
                 val json = JSONObject(raw)
-                dozeWhitelisted = json.optBoolean("dozeWhitelisted", false)
+                dozeWhitelisted = json.optBoolean("dozeWhitelisted", false) || batteryIgnored
                 standbyActive = json.optBoolean("standbyActive", false)
                 appOpsAllowed = json.optBoolean("appOpsAllowed", false)
                 watchdogActive = json.optBoolean("watchdogActive", false)
                 val bucket = json.optString("standbyBucket", "?")
-                reportSummary = "Bucket=$bucket | Doze=${dozeWhitelisted} | AppOps=${appOpsAllowed}"
+                val bucketLabel = when (bucket) {
+                    "5" -> "5(已豁免)"
+                    "10" -> "10(Active)"
+                    else -> bucket
+                }
+                val watchdogLabel = if (watchdogActive) "看门狗运行中" else "看门狗未开启"
+                reportSummary = "Bucket=$bucketLabel | Doze=$dozeWhitelisted | AppOps=$appOpsAllowed | $watchdogLabel"
             } catch (_: Throwable) {
             }
         }

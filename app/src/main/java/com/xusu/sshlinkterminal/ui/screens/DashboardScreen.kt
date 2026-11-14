@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -71,6 +72,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
@@ -97,11 +99,13 @@ import com.xusu.sshlinkterminal.ui.glass.NarrowGlassRail
 import com.xusu.sshlinkterminal.ui.glass.NarrowRailWidth
 import com.xusu.sshlinkterminal.ui.glass.ThreeStateWindowSwitch
 import com.xusu.sshlinkterminal.ui.glass.glassHaze
+import com.xusu.sshlinkterminal.ui.theme.contrastOnColor
 import com.xusu.sshlinkterminal.ui.theme.getDeviceCornerRadius
 import com.xusu.sshlinkterminal.ui.theme.getDisplayCutoutTopPadding
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
+import java.util.Locale
 
 @Composable
 fun DashboardScreen(
@@ -137,12 +141,24 @@ fun DashboardScreen(
     val activeSessionsCount = sessions.values.count {
         it.state == SessionState.CONNECTED || it.state == SessionState.AWAITING_OAUTH
     }
+    val hasRunningConnections = sessions.values.any {
+        it.state == SessionState.CONNECTED ||
+            it.state == SessionState.CONNECTING ||
+            it.state == SessionState.RECONNECTING ||
+            it.state == SessionState.AWAITING_OAUTH ||
+            it.state == SessionState.AWAITING_INPUT
+    }
     val guardHealthy = guardStatus.notificationsGranted &&
         guardStatus.batteryOptimizationIgnored &&
         guardStatus.shizukuPermissionGranted
     val accentColor = if (colorBag.useM3Color) MaterialTheme.colorScheme.primary else colorBag.vibrant
+    val outlineAccent = if (!colorBag.useM3Color && accentColor.luminance() < 0.14f) {
+        colorBag.lightMuted
+    } else {
+        accentColor
+    }
     val secondaryColor = if (colorBag.useM3Color) MaterialTheme.colorScheme.secondary else colorBag.muted
-    val guardianActive = guardStatus.foregroundServiceRunning || activeSessionsCount > 0
+    val guardianActive = guardStatus.foregroundServiceRunning || hasRunningConnections
 
     Box(modifier = modifier.fillMaxSize()) {
         // Full-bleed Wallpaper Background for Glass Effect
@@ -251,12 +267,12 @@ fun DashboardScreen(
                                 ) {
                                     Surface(
                                         shape = CircleShape,
-                                        color = (if (guardHealthy) Color(0xFF4ADE80) else accentColor).copy(alpha = 0.20f),
-                                        border = BorderStroke(1.dp, (if (guardHealthy) Color(0xFF4ADE80) else accentColor).copy(alpha = 0.6f))
+                                        color = (if (guardHealthy) Color(0xFF4ADE80) else outlineAccent).copy(alpha = 0.20f),
+                                        border = BorderStroke(1.dp, (if (guardHealthy) Color(0xFF4ADE80) else outlineAccent).copy(alpha = 0.6f))
                                     ) {
                                         Text(
                                             text = if (guardStatus.watchdogActive) "SHIZUKU 守护已武装" else "LINK TERMINAL",
-                                            color = if (guardHealthy) Color(0xFF86EFAC) else accentColor,
+                                            color = if (guardHealthy) Color(0xFF86EFAC) else outlineAccent,
                                             fontSize = 10.sp,
                                             fontWeight = FontWeight.Bold,
                                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
@@ -316,8 +332,17 @@ fun DashboardScreen(
                                         fontWeight = FontWeight.Bold
                                     )
                                     val latestRtt = rttSamples.lastOrNull()?.rttMs
+                                    val avgRtt = if (rttSamples.isNotEmpty()) {
+                                        rttSamples.map { it.rttMs }.average()
+                                    } else {
+                                        null
+                                    }
                                     Text(
-                                        text = if (latestRtt != null) "最近心跳 ${latestRtt}ms · 守护常驻" else "启动守护后实时采集 SSH 心跳",
+                                        text = if (latestRtt != null && avgRtt != null) {
+                                            "实时 ${latestRtt}ms · 均值 ${String.format(Locale.US, "%.1f", avgRtt)}ms"
+                                        } else {
+                                            "开启连接后实时采集 SSH 心跳"
+                                        },
                                         color = Color(0xFF94A3B8),
                                         style = MaterialTheme.typography.labelSmall
                                     )
@@ -332,7 +357,7 @@ fun DashboardScreen(
                             SshLatencyChart(
                                 samples = rttSamples,
                                 windowRule = chartWindow,
-                                accentColor = accentColor,
+                                accentColor = outlineAccent,
                                 secondaryColor = secondaryColor,
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -346,19 +371,21 @@ fun DashboardScreen(
                             ) {
                                 GuardianControlButton(
                                     isRunning = guardianActive,
-                                    activeLabel = "停止全部守护",
-                                    inactiveLabel = "一键守护并恢复",
+                                    activeLabel = "断开所有连接",
+                                    inactiveLabel = "开启所有连接",
+                                    accentColor = outlineAccent,
                                     onClick = onToggleGuardianAll,
                                     modifier = Modifier.weight(1f)
                                 )
                                 FilledTonalButton(
                                     onClick = { onOpenTerminalScreen(null) },
                                     shape = RoundedCornerShape(16.dp),
+                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
                                     modifier = Modifier.height(46.dp)
                                 ) {
                                     Icon(Icons.Rounded.Terminal, contentDescription = null, modifier = Modifier.size(18.dp))
                                     Spacer(Modifier.width(6.dp))
-                                    Text("终端")
+                                    Text("终端", maxLines = 1, softWrap = false)
                                 }
                             }
                         }
@@ -377,9 +404,9 @@ fun DashboardScreen(
                             fontWeight = FontWeight.Bold
                         )
                         TextButton(onClick = { showCreateHost = true }) {
-                            Icon(Icons.Rounded.Add, contentDescription = null, tint = accentColor, modifier = Modifier.size(18.dp))
+                            Icon(Icons.Rounded.Add, contentDescription = null, tint = outlineAccent, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("新增主机", color = accentColor)
+                            Text("新增主机", color = outlineAccent)
                         }
                     }
 
@@ -408,7 +435,7 @@ fun DashboardScreen(
         FloatingActionButton(
             onClick = { showCreateHost = true },
             containerColor = accentColor,
-            contentColor = colorBag.darkMuted,
+            contentColor = contrastOnColor(accentColor),
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .navigationBarsPadding()
@@ -586,11 +613,12 @@ private fun HostProfileCard(
                         FilledTonalButton(
                             onClick = onOpenTerminal,
                             shape = RoundedCornerShape(12.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 2.dp),
                             modifier = Modifier.height(34.dp)
                         ) {
                             Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("连接", fontSize = 12.sp)
+                            Text("连接", fontSize = 12.sp, maxLines = 1, softWrap = false)
                         }
                     }
                 }
@@ -614,7 +642,7 @@ fun HostEditorDialog(
     var authType by remember { mutableStateOf(initial?.authType ?: AuthType.PASSWORD) }
     var password by remember { mutableStateOf(VaultCrypto.decrypt(initial?.encryptedPassword)) }
     var selectedKeyId by remember { mutableStateOf(initial?.keyId ?: keys.firstOrNull()?.id) }
-    var autoAttach by remember { mutableStateOf(initial?.autoAttachCommand ?: "tmux new-session -A -s main || true") }
+    var autoAttach by remember { mutableStateOf(initial?.autoAttachCommand ?: "") }
     var keepAliveSec by remember { mutableStateOf((initial?.keepAliveIntervalSec ?: 15).toString()) }
     var autoReconnect by remember { mutableStateOf(initial?.autoReconnect ?: true) }
     var pinInDaemon by remember { mutableStateOf(initial?.pinInDaemon ?: true) }
@@ -754,10 +782,25 @@ fun HostEditorDialog(
                 OutlinedTextField(
                     value = autoAttach,
                     onValueChange = { autoAttach = it },
-                    label = { Text("登录后自动附着命令（防断线丢会话）") },
+                    label = { Text("登录后自动附着命令（可选）") },
+                    placeholder = { Text("留空则直接进入默认 Shell；Linux 可填 tmux") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilterChip(
+                        selected = autoAttach.trim() == "tmux new-session -A -s main",
+                        onClick = { autoAttach = "tmux new-session -A -s main" },
+                        label = { Text("填入 Linux tmux") }
+                    )
+                    if (autoAttach.isNotEmpty()) {
+                        FilterChip(
+                            selected = false,
+                            onClick = { autoAttach = "" },
+                            label = { Text("清空") }
+                        )
+                    }
+                }
                 OutlinedTextField(
                     value = keepAliveSec,
                     onValueChange = { keepAliveSec = it.filter(Char::isDigit) },

@@ -1,7 +1,5 @@
 package com.xusu.sshlinkterminal.ui.chart
 
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
@@ -26,6 +24,7 @@ import com.patrykandpatrick.vico.compose.cartesian.axis.HorizontalAxis
 import com.patrykandpatrick.vico.compose.cartesian.axis.VerticalAxis
 import com.patrykandpatrick.vico.compose.cartesian.axis.rememberAxisLabelComponent
 import com.patrykandpatrick.vico.compose.cartesian.data.CartesianChartModelProducer
+import com.patrykandpatrick.vico.compose.cartesian.data.CartesianLayerRangeProvider
 import com.patrykandpatrick.vico.compose.cartesian.data.CartesianValueFormatter
 import com.patrykandpatrick.vico.compose.cartesian.data.lineSeries
 import com.patrykandpatrick.vico.compose.cartesian.layer.CartesianLayerDimensions
@@ -41,6 +40,7 @@ import com.patrykandpatrick.vico.compose.cartesian.rememberVicoZoomState
 import com.patrykandpatrick.vico.compose.common.Fill
 import com.patrykandpatrick.vico.compose.common.component.Component
 import com.patrykandpatrick.vico.compose.common.component.rememberShapeComponent
+import com.patrykandpatrick.vico.compose.common.data.ExtraStore
 import com.xusu.sshlinkterminal.data.ChartWindowRule
 import com.xusu.sshlinkterminal.data.RttSample
 import java.time.Instant
@@ -49,6 +49,8 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.roundToInt
 
 private val AXIS_TIME_SECONDS = DateTimeFormatter.ofPattern("HH:mm:ss", Locale.US)
 private val AXIS_TIME_MINUTES = DateTimeFormatter.ofPattern("HH:mm", Locale.US)
@@ -135,16 +137,39 @@ fun SshLatencyChart(
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
     val displaySamples = remember(samples, windowRule) {
-        if (samples.size >= 2) {
-            when (windowRule) {
-                ChartWindowRule.MINUTE -> samples.takeLast(20)
-                ChartWindowRule.HOUR -> samples.takeLast(60)
-                ChartWindowRule.DAY -> samples
+        when {
+            samples.size >= 2 -> {
+                val latestTs = samples.last().timestampSec
+                val horizonSec = when (windowRule) {
+                    ChartWindowRule.MINUTE -> 60L
+                    ChartWindowRule.HOUR -> 3_600L
+                    ChartWindowRule.DAY -> 86_400L
+                }
+                val windowed = samples.filter { it.timestampSec >= latestTs - horizonSec }
+                when (windowRule) {
+                    ChartWindowRule.MINUTE -> {
+                        if (windowed.size >= 2) windowed else samples.takeLast(minOf(samples.size, 6))
+                    }
+                    ChartWindowRule.HOUR -> {
+                        val base = if (windowed.size >= 2) windowed else samples
+                        base.takeLast(120)
+                    }
+                    ChartWindowRule.DAY -> samples
+                }
             }
-        } else {
-            val now = System.currentTimeMillis() / 1000L
-            List(12) { idx ->
-                RttSample(timestampSec = now - (11 - idx) * 15L, rttMs = 0L, activeSessions = 0)
+            samples.size == 1 -> {
+                val first = samples.first()
+                listOf(
+                    first.copy(timestampSec = first.timestampSec - 5L),
+                    first
+                )
+            }
+            else -> {
+                val now = System.currentTimeMillis() / 1000L
+                listOf(
+                    RttSample(timestampSec = now - 60L, rttMs = 0L, activeSessions = 0),
+                    RttSample(timestampSec = now, rttMs = 0L, activeSessions = 0)
+                )
             }
         }
     }
@@ -156,11 +181,15 @@ fun SshLatencyChart(
     LaunchedEffect(displaySamples) {
         val xs = displaySamples.map { it.timestampSec.toDouble() }
         val ys = displaySamples.map { it.rttMs.toDouble() }
-        val activeLine = displaySamples.map { (it.activeSessions * 10L).toDouble() }
+        var runningSum = 0.0
+        val rollingAvgLine = displaySamples.mapIndexed { idx, sample ->
+            runningSum += sample.rttMs.toDouble()
+            runningSum / (idx + 1).toDouble()
+        }
         modelProducer.runTransaction {
             lineSeries {
                 series(xs, ys)
-                series(xs, activeLine)
+                series(xs, rollingAvgLine)
             }
         }
     }
@@ -173,14 +202,22 @@ fun SshLatencyChart(
     }
     val yFormatter = remember {
         CartesianValueFormatter { _, value, _ ->
-            "${value.toInt()} ms"
+            "${value.roundToInt()} ms"
+        }
+    }
+    val rangeProvider = remember {
+        object : CartesianLayerRangeProvider {
+            override fun getMinY(minY: Double, maxY: Double, extraStore: ExtraStore): Double = 0.0
+
+            override fun getMaxY(minY: Double, maxY: Double, extraStore: ExtraStore): Double =
+                maxOf(5.0, ceil(maxY / 5.0) * 5.0)
         }
     }
     val itemPlacer = remember(windowRule) {
         when (windowRule) {
-            ChartWindowRule.MINUTE -> StableTimeAxisItemPlacer(labelCount = 4, edgeInsetFraction = 0.14)
-            ChartWindowRule.HOUR -> StableTimeAxisItemPlacer(labelCount = 5, edgeInsetFraction = 0.12)
-            ChartWindowRule.DAY -> StableTimeAxisItemPlacer(labelCount = 4, edgeInsetFraction = 0.16)
+            ChartWindowRule.MINUTE -> StableTimeAxisItemPlacer(labelCount = 3, edgeInsetFraction = 0.18)
+            ChartWindowRule.HOUR -> StableTimeAxisItemPlacer(labelCount = 3, edgeInsetFraction = 0.18)
+            ChartWindowRule.DAY -> StableTimeAxisItemPlacer(labelCount = 3, edgeInsetFraction = 0.18)
         }
     }
 
@@ -199,6 +236,7 @@ fun SshLatencyChart(
     CartesianChartHost(
         chart = rememberCartesianChart(
             rememberLineCartesianLayer(
+                rangeProvider = rangeProvider,
                 lineProvider = LineCartesianLayer.LineProvider.series(
                     LineCartesianLayer.rememberLine(
                         fill = LineCartesianLayer.LineFill.single(Fill(accentColor)),
@@ -219,7 +257,7 @@ fun SshLatencyChart(
                         interpolator = LineCartesianLayer.Interpolator.cubic(curvature = 0.35f)
                     ),
                     LineCartesianLayer.rememberLine(
-                        fill = LineCartesianLayer.LineFill.single(Fill(secondaryColor.copy(alpha = 0.7f))),
+                        fill = LineCartesianLayer.LineFill.single(Fill(secondaryColor.copy(alpha = 0.72f))),
                         stroke = LineCartesianLayer.LineStroke.Continuous(
                             thickness = 1.6.dp,
                             cap = StrokeCap.Round
@@ -258,7 +296,8 @@ fun SshLatencyChart(
         modifier = modifier,
         zoomState = rememberVicoZoomState(zoomEnabled = false, initialZoom = Zoom.Content),
         scrollState = rememberVicoScrollState(scrollEnabled = false),
-        animationSpec = tween(durationMillis = 360, easing = FastOutSlowInEasing),
-        animateIn = true
+        // Disable diff interpolation so newly added X timestamps appear cleanly instead of animating up from 0 ms.
+        animationSpec = null,
+        animateIn = false
     )
 }

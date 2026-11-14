@@ -178,11 +178,12 @@ fun GuardStatusOverlay(
                         GuardCheckRow(
                             icon = Icons.Rounded.Shield,
                             title = "Shizuku Doze / Standby / AppOps 加固",
-                            subtitle = guardStatus.lastReport.ifBlank { "将进程设为 Active 并允许后台任意运行" },
+                            subtitle = guardStatus.lastReport.ifBlank { "将进程设为白名单并启动 Daemon 看门狗" },
                             passed = guardStatus.dozeWhitelisted == true &&
+                                guardStatus.standbyBucketActive != false &&
                                 guardStatus.appOpsBackgroundAllowed == true &&
                                 guardStatus.watchdogActive,
-                            actionLabel = "加固",
+                            actionLabel = "执行加固",
                             onAction = onApplyShizukuHarden
                         )
 

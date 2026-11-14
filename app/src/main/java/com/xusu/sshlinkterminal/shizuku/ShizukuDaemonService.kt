@@ -58,12 +58,11 @@ class ShizukuDaemonService : IShizukuDaemonService.Stub() {
     override fun queryHardeningStatus(packageName: String): String {
         val safePkg = sanitizePackageName(packageName) ?: return JSONObject().toString()
         val whitelistOut = runShell("cmd deviceidle whitelist")
-        val dozeWhitelisted = whitelistOut.output.lines().any { line ->
-            line.trim().endsWith(",$safePkg") || line.contains(":$safePkg") || line.trim() == safePkg
-        }
+        val dozeWhitelisted = isPackageInWhitelistOutput(whitelistOut.output, safePkg)
 
         val bucketOut = runShell("am get-standby-bucket $safePkg")
-        val bucketCode = bucketOut.output.trim().toIntOrNull()
+        val bucketRaw = bucketOut.output.trim().lineSequence().lastOrNull()?.trim().orEmpty()
+        val bucketCode = bucketRaw.toIntOrNull()
         val standbyActive = bucketCode != null && bucketCode <= 10
 
         val appOpsOut = runShell("cmd appops get $safePkg RUN_ANY_IN_BACKGROUND")
@@ -72,7 +71,7 @@ class ShizukuDaemonService : IShizukuDaemonService.Stub() {
         return JSONObject()
             .put("dozeWhitelisted", dozeWhitelisted)
             .put("standbyActive", standbyActive)
-            .put("standbyBucket", bucketOut.output.trim())
+            .put("standbyBucket", bucketRaw.ifBlank { "?" })
             .put("appOpsAllowed", appOpsAllowed)
             .put("watchdogActive", watchdogRunning.get())
             .toString()
@@ -167,5 +166,19 @@ class ShizukuDaemonService : IShizukuDaemonService.Stub() {
         private const val WATCHDOG_POLL_MS = 10_000L
         private const val HEARTBEAT_TIMEOUT_MS = 45_000L
         private const val REVIVE_COOLDOWN_MS = 30_000L
+
+        /**
+         * Matches Android `cmd deviceidle whitelist` output formats across API levels,
+         * e.g. `user,com.example.app,10544`, `system,com.example.app`, or `com.example.app`.
+         */
+        internal fun isPackageInWhitelistOutput(output: String, packageName: String): Boolean {
+            return output.lineSequence().any { raw ->
+                val line = raw.trim()
+                if (line.isEmpty()) return@any false
+                line == packageName ||
+                    line.split(',').any { it.trim() == packageName } ||
+                    line.contains(":$packageName")
+            }
+        }
     }
 }

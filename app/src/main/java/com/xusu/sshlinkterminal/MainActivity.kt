@@ -5,10 +5,12 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -41,6 +43,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -52,13 +55,12 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.xusu.sshlinkterminal.data.ColorBag
 import com.xusu.sshlinkterminal.data.MacroButton
+import com.xusu.sshlinkterminal.data.SessionState
 import com.xusu.sshlinkterminal.service.TerminalForegroundService
 import com.xusu.sshlinkterminal.ui.components.GuardStatusOverlay
-import com.xusu.sshlinkterminal.ui.glass.CaptureGlassBackdrop
 import com.xusu.sshlinkterminal.ui.glass.NarrowRailWidth
 import com.xusu.sshlinkterminal.ui.glass.ResponsiveSideMenuLayout
 import com.xusu.sshlinkterminal.ui.glass.SideMenuItem
-import com.xusu.sshlinkterminal.ui.glass.rememberGlassBackdrop
 import com.xusu.sshlinkterminal.ui.glass.rememberSideMenuState
 import com.xusu.sshlinkterminal.ui.screens.AppearanceSettingsScreen
 import com.xusu.sshlinkterminal.ui.screens.DashboardScreen
@@ -70,9 +72,11 @@ import com.xusu.sshlinkterminal.ui.theme.LinkTerminalTheme
 import com.xusu.sshlinkterminal.ui.theme.LoadedHeroWallpaper
 import com.xusu.sshlinkterminal.ui.theme.WallpaperControlsTheme
 import com.xusu.sshlinkterminal.ui.theme.loadHeroWallpaperAndPalette
-import dev.chrisbanes.haze.rememberHazeState
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -109,11 +113,12 @@ class MainActivity : ComponentActivity() {
             val navController = rememberNavController()
 
             var loadedHero by remember { mutableStateOf<LoadedHeroWallpaper?>(null) }
-            LaunchedEffect(uiPrefs.wallpaperUri, uiPrefs.useM3Color) {
+            LaunchedEffect(uiPrefs.wallpaperUri, uiPrefs.useM3Color, uiPrefs.accentDepth) {
                 loadedHero = loadHeroWallpaperAndPalette(
                     context = context,
                     wallpaperUri = uiPrefs.wallpaperUri,
-                    useM3Color = uiPrefs.useM3Color
+                    useM3Color = uiPrefs.useM3Color,
+                    accentDepth = uiPrefs.accentDepth
                 )
             }
             val colorBag = loadedHero?.colorBag ?: ColorBag.Default.copy(useM3Color = uiPrefs.useM3Color)
@@ -142,15 +147,117 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
+            val fontPicker = rememberLauncherForActivityResult(
+                ActivityResultContracts.OpenDocument()
+            ) { uri ->
+                if (uri != null) {
+                    scope.launch {
+                        val imported = withContext(Dispatchers.IO) {
+                            importTerminalFontFile(context, uri)
+                        }
+                        if (imported != null) {
+                            val (destPath, displayName) = imported
+                            app.repository.updateUiPreferences {
+                                it.copy(
+                                    terminalUseMonospace = true,
+                                    terminalFontPreset = "CUSTOM",
+                                    terminalCustomFontPath = destPath,
+                                    terminalCustomFontName = displayName
+                                )
+                            }
+                            Toast.makeText(context, "已载入字体: $displayName", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(context, "无法解析所选字体（请选 .ttf / .otf）", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+
             val lifecycleOwner = LocalLifecycleOwner.current
+            var isResumed by remember { mutableStateOf(false) }
             DisposableEffect(lifecycleOwner) {
                 val observer = LifecycleEventObserver { _, event ->
-                    if (event == Lifecycle.Event.ON_RESUME) {
-                        scope.launch { app.shizukuManager.refreshStatus() }
+                    when (event) {
+                        Lifecycle.Event.ON_RESUME -> {
+                            isResumed = true
+                            scope.launch { app.shizukuManager.refreshStatus() }
+                        }
+                        Lifecycle.Event.ON_PAUSE -> {
+                            isResumed = false
+                        }
+                        else -> Unit
                     }
                 }
                 lifecycleOwner.lifecycle.addObserver(observer)
                 onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+            }
+
+            // First-run proactive Shizuku permission prompt (only once when Shizuku is running & ungranted)
+            LaunchedEffect(isResumed, guardStatus.shizukuRunning, guardStatus.shizukuPermissionGranted) {
+                if (isResumed &&
+                    guardStatus.shizukuRunning &&
+                    !guardStatus.shizukuPermissionGranted &&
+                    !app.repository.hasPromptedShizukuPermission()
+                ) {
+                    delay(450L)
+                    if (!app.shizukuManager.isShizukuPermissionGranted() &&
+                        !app.repository.hasPromptedShizukuPermission()
+                    ) {
+                        app.repository.markShizukuPermissionPrompted()
+                        app.shizukuManager.requestShizukuPermission()
+                    }
+                }
+            }
+
+            fun requestShizukuWithFeedback() {
+                scope.launch {
+                    val status = app.shizukuManager.refreshStatus()
+                    when {
+                        !status.shizukuInstalled -> {
+                            Toast.makeText(
+                                context,
+                                "未检测到 Shizuku App（不使用也可正常用 SSH）",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                        !status.shizukuRunning -> {
+                            Toast.makeText(
+                                context,
+                                "Shizuku 服务尚未启动，请先在 Shizuku 中启动服务",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                        status.shizukuPermissionGranted -> {
+                            Toast.makeText(context, "Shizuku 已获得授权", Toast.LENGTH_SHORT).show()
+                        }
+                        else -> {
+                            app.repository.markShizukuPermissionPrompted()
+                            val launched = app.shizukuManager.requestShizukuPermission()
+                            if (!launched) {
+                                Toast.makeText(
+                                    context,
+                                    "无法拉起 Shizuku 授权框，请检查 Shizuku 状态",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+                    }
+                }
+            }
+
+            fun applyShizukuHardeningWithFeedback() {
+                scope.launch {
+                    val result = app.shizukuManager.applyHardeningAndWatchdog(silent = false)
+                    val ok = result.dozeWhitelisted == true &&
+                        result.appOpsBackgroundAllowed == true &&
+                        result.watchdogActive
+                    val msg = when {
+                        ok -> "加固生效: ${result.lastReport}"
+                        result.lastReport.isNotBlank() -> result.lastReport
+                        else -> "Shizuku 加固未完成，请确认 Shizuku 权限与服务状态"
+                    }
+                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                }
             }
 
             val (timeText, batteryPct, charging) = rememberClockAndBattery(context)
@@ -184,8 +291,6 @@ class MainActivity : ComponentActivity() {
                     ) {
                         composable(Routes.DASHBOARD) {
                             val sideMenuState = rememberSideMenuState()
-                            val backdrop = rememberGlassBackdrop()
-                            val backdropHaze = rememberHazeState()
 
                             val drawerItems = remember {
                                 listOf(
@@ -200,7 +305,7 @@ class MainActivity : ComponentActivity() {
                             ResponsiveSideMenuLayout(
                                 state = sideMenuState,
                                 railPadding = NarrowRailWidth,
-                                backdrop = backdrop,
+                                blurRadius = uiPrefs.blurRadius,
                                 colorBag = colorBag,
                                 springAnimation = uiPrefs.springAnimation,
                                 showWallpaper = uiPrefs.showWallpaper,
@@ -210,23 +315,19 @@ class MainActivity : ComponentActivity() {
                                         Text(
                                             "SSH Link Terminal",
                                             style = MaterialTheme.typography.titleLarge,
-                                            fontWeight = FontWeight.Bold
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.White
                                         )
                                         Text(
                                             "Shizuku 守护 · 防断连 · 链接直跳",
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            color = Color.White.copy(alpha = 0.72f)
                                         )
                                         Spacer(Modifier.height(10.dp))
                                     }
                                 },
                                 drawerItems = drawerItems,
                                 mainContent = { startPadding ->
-                                    CaptureGlassBackdrop(
-                                        backdrop = backdrop,
-                                        hazeState = backdropHaze,
-                                        blurIntensity = uiPrefs.blurRadius
-                                    )
                                     DashboardScreen(
                                         heroBitmap = loadedHero?.imageBitmap,
                                         colorBag = colorBag,
@@ -261,16 +362,26 @@ class MainActivity : ComponentActivity() {
                                         onConnectHost = { host -> app.sshManager.openAndConnect(host) },
                                         onDisconnectHost = { hostId -> app.sshManager.disconnectHost(hostId) },
                                         onToggleGuardianAll = {
-                                            if (guardStatus.foregroundServiceRunning || app.sshManager.activeConnectedCount() > 0) {
+                                            val hasRunning = guardStatus.foregroundServiceRunning || sessions.values.any {
+                                                it.state == SessionState.CONNECTED ||
+                                                    it.state == SessionState.CONNECTING ||
+                                                    it.state == SessionState.RECONNECTING ||
+                                                    it.state == SessionState.AWAITING_OAUTH ||
+                                                    it.state == SessionState.AWAITING_INPUT
+                                            }
+                                            if (hasRunning) {
                                                 app.sshManager.disconnectAll()
                                                 app.shizukuManager.stopWatchdog()
                                                 context.stopService(Intent(context, TerminalForegroundService::class.java))
                                             } else {
                                                 TerminalForegroundService.ensureStarted(
                                                     context,
-                                                    TerminalForegroundService.ACTION_RESTORE_PINNED
+                                                    TerminalForegroundService.ACTION_START_GUARDIAN
                                                 )
-                                                app.shizukuManager.bindDaemonService()
+                                                app.sshManager.connectAll()
+                                                if (app.shizukuManager.isShizukuPermissionGranted() && uiPrefs.autoHardenWithShizuku) {
+                                                    app.shizukuManager.bindDaemonService()
+                                                }
                                             }
                                         },
                                         onSaveHost = { host ->
@@ -305,12 +416,16 @@ class MainActivity : ComponentActivity() {
                                         )
                                         Routes.SETTINGS -> AppearanceSettingsScreen(
                                             prefs = uiPrefs,
+                                            guardStatus = guardStatus,
                                             onBack = onBackDetail,
                                             onUpdatePrefs = app.repository::updateUiPreferences,
                                             onPickWallpaper = { wallpaperPicker.launch(arrayOf("image/*")) },
                                             onResetWallpaper = {
                                                 app.repository.updateUiPreferences { it.copy(wallpaperUri = null) }
-                                            }
+                                            },
+                                            onPickTerminalFont = { fontPicker.launch(arrayOf("*/*")) },
+                                            onRequestShizuku = ::requestShizukuWithFeedback,
+                                            onApplyShizukuHarden = ::applyShizukuHardeningWithFeedback
                                         )
                                         Routes.LOGS -> LogsAndAboutScreen(
                                             logs = logs,
@@ -333,18 +448,8 @@ class MainActivity : ComponentActivity() {
                                     }
                                 },
                                 onRequestBatteryWhitelist = { openBatteryWhitelistSettings() },
-                                onRequestShizuku = {
-                                    val launched = app.shizukuManager.requestShizukuPermission()
-                                    if (!launched) {
-                                        Toast.makeText(context, "请先启动 Shizuku 服务", Toast.LENGTH_SHORT).show()
-                                    }
-                                },
-                                onApplyShizukuHarden = {
-                                    scope.launch {
-                                        app.shizukuManager.applyHardeningAndWatchdog(silent = false)
-                                        Toast.makeText(context, "已下发 Shizuku 加固指令", Toast.LENGTH_SHORT).show()
-                                    }
-                                },
+                                onRequestShizuku = ::requestShizukuWithFeedback,
+                                onApplyShizukuHarden = ::applyShizukuHardeningWithFeedback,
                                 onOpenAppSettings = { openAppDetailSettings() }
                             )
                         }
@@ -441,12 +546,16 @@ class MainActivity : ComponentActivity() {
                         composable(Routes.SETTINGS) {
                             AppearanceSettingsScreen(
                                 prefs = uiPrefs,
+                                guardStatus = guardStatus,
                                 onBack = { navController.popBackStack() },
                                 onUpdatePrefs = app.repository::updateUiPreferences,
                                 onPickWallpaper = { wallpaperPicker.launch(arrayOf("image/*")) },
                                 onResetWallpaper = {
                                     app.repository.updateUiPreferences { it.copy(wallpaperUri = null) }
-                                }
+                                },
+                                onPickTerminalFont = { fontPicker.launch(arrayOf("*/*")) },
+                                onRequestShizuku = ::requestShizukuWithFeedback,
+                                onApplyShizukuHarden = ::applyShizukuHardeningWithFeedback
                             )
                         }
 
@@ -503,4 +612,50 @@ private fun rememberClockAndBattery(context: Context): Triple<String, Float, Boo
     }
 
     return Triple(timeText, batteryPct, isCharging)
+}
+
+private fun importTerminalFontFile(context: Context, uri: Uri): Pair<String, String>? {
+    val resolver = context.contentResolver
+    var rawName = "custom_font.ttf"
+    resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+        if (cursor.moveToFirst()) {
+            val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (idx >= 0) {
+                rawName = cursor.getString(idx).orEmpty().ifBlank { rawName }
+            }
+        }
+    }
+    val safeName = rawName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+    val dir = File(context.filesDir, "fonts").apply { mkdirs() }
+    val dest = File(dir, "terminal_$safeName")
+    val copied = runCatching {
+        resolver.openInputStream(uri)?.use { input ->
+            dest.outputStream().use { output -> input.copyTo(output) }
+        }
+        dest.length() > 16L
+    }.getOrDefault(false)
+    if (!copied) {
+        dest.delete()
+        return null
+    }
+
+    // Validate TTF / OTF / TTC SFNT header magic bytes before accepting the file.
+    val validHeader = runCatching {
+        val header = ByteArray(4)
+        dest.inputStream().use { it.read(header) }
+        val tag = String(header, Charsets.US_ASCII)
+        val isSfntTrueType = header[0] == 0.toByte() && header[1] == 1.toByte() && header[2] == 0.toByte() && header[3] == 0.toByte()
+        isSfntTrueType || tag == "OTTO" || tag == "ttcf" || tag == "true" || tag == "typ1"
+    }.getOrDefault(false)
+    if (!validHeader) {
+        dest.delete()
+        return null
+    }
+
+    val loaded = runCatching { Typeface.createFromFile(dest) }.getOrNull()
+    if (loaded == null) {
+        dest.delete()
+        return null
+    }
+    return dest.absolutePath to rawName
 }
