@@ -359,6 +359,7 @@ fun DashboardScreen(
                                 windowRule = chartWindow,
                                 accentColor = outlineAccent,
                                 secondaryColor = secondaryColor,
+                                animateAxisSwitch = uiPreferences.chartAxisAnimation,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .height(148.dp)

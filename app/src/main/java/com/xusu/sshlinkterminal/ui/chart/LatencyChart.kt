@@ -1,10 +1,15 @@
 package com.xusu.sshlinkterminal.ui.chart
 
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -43,6 +48,7 @@ import com.patrykandpatrick.vico.compose.common.component.rememberShapeComponent
 import com.patrykandpatrick.vico.compose.common.data.ExtraStore
 import com.xusu.sshlinkterminal.data.ChartWindowRule
 import com.xusu.sshlinkterminal.data.RttSample
+import kotlinx.coroutines.delay
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -133,9 +139,22 @@ fun SshLatencyChart(
     windowRule: ChartWindowRule,
     accentColor: Color,
     secondaryColor: Color,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    animateAxisSwitch: Boolean = true
 ) {
     val modelProducer = remember { CartesianChartModelProducer() }
+    var lastWindowRule by remember { mutableStateOf(windowRule) }
+    var isWindowTransition by remember { mutableStateOf(false) }
+    if (windowRule != lastWindowRule) {
+        lastWindowRule = windowRule
+        isWindowTransition = true
+    }
+    LaunchedEffect(isWindowTransition) {
+        if (isWindowTransition) {
+            delay(420L)
+            isWindowTransition = false
+        }
+    }
     val displaySamples = remember(samples, windowRule) {
         when {
             samples.size >= 2 -> {
@@ -296,8 +315,12 @@ fun SshLatencyChart(
         modifier = modifier,
         zoomState = rememberVicoZoomState(zoomEnabled = false, initialZoom = Zoom.Content),
         scrollState = rememberVicoScrollState(scrollEnabled = false),
-        // Disable diff interpolation so newly added X timestamps appear cleanly instead of animating up from 0 ms.
-        animationSpec = null,
-        animateIn = false
+        // Animate axis compression/expansion on M/H/D switches when enabled, while keeping live sample appends jitter-free.
+        animationSpec = if (animateAxisSwitch && isWindowTransition) {
+            tween(durationMillis = 360, easing = FastOutSlowInEasing)
+        } else {
+            null
+        },
+        animateIn = animateAxisSwitch
     )
 }

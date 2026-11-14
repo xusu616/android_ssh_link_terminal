@@ -81,7 +81,8 @@ data class UiPreferences(
     val hapticFeedback: Boolean = true,
     val autoHardenWithShizuku: Boolean = true,
     val autoStartOnBoot: Boolean = true,
-    val topComponentPressedDown: Boolean = true
+    val topComponentPressedDown: Boolean = true,
+    val chartAxisAnimation: Boolean = true
 )
 
 data class ColorBag(

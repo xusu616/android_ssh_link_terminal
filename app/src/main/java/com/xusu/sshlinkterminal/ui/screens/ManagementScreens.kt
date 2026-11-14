@@ -644,6 +644,12 @@ fun AppearanceSettingsScreen(
                 onCheckedChange = { checked -> onUpdatePrefs { it.copy(springAnimation = checked, hapticFeedback = checked) } }
             )
             PrefSwitchRow(
+                title = "延迟图表坐标轴切换动画",
+                subtitle = "切换 M / H / D 时间窗时启用坐标轴压缩与展开动画",
+                checked = prefs.chartAxisAnimation,
+                onCheckedChange = { checked -> onUpdatePrefs { it.copy(chartAxisAnimation = checked) } }
+            )
+            PrefSwitchRow(
                 title = "避让顶部挖孔屏安全区",
                 subtitle = "开启后主屏 Hero 卡片自动向下避让摄像头挖孔",
                 checked = prefs.topComponentPressedDown,

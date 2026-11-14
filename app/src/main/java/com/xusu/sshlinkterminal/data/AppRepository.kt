@@ -285,7 +285,8 @@ class AppRepository(context: Context) {
             hapticFeedback = prefs.getBoolean("ui_haptic", true),
             autoHardenWithShizuku = prefs.getBoolean("ui_auto_harden_shizuku", true),
             autoStartOnBoot = prefs.getBoolean("ui_auto_start_boot", true),
-            topComponentPressedDown = prefs.getBoolean("ui_top_pressed_down", true)
+            topComponentPressedDown = prefs.getBoolean("ui_top_pressed_down", true),
+            chartAxisAnimation = prefs.getBoolean("ui_chart_axis_anim", true)
         )
     }
 
@@ -309,6 +310,7 @@ class AppRepository(context: Context) {
             putBoolean("ui_auto_harden_shizuku", value.autoHardenWithShizuku)
             putBoolean("ui_auto_start_boot", value.autoStartOnBoot)
             putBoolean("ui_top_pressed_down", value.topComponentPressedDown)
+            putBoolean("ui_chart_axis_anim", value.chartAxisAnimation)
         }
     }
 
