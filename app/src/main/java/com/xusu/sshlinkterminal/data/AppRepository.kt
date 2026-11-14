@@ -24,7 +24,7 @@ class AppRepository(context: Context) {
     private val _uiPreferences = MutableStateFlow(loadUiPreferences())
     val uiPreferences: StateFlow<UiPreferences> = _uiPreferences.asStateFlow()
 
-    private val _rttSamples = MutableStateFlow<List<RttSample>>(emptyList())
+    private val _rttSamples = MutableStateFlow(loadRttSamples())
     val rttSamples: StateFlow<List<RttSample>> = _rttSamples.asStateFlow()
 
     private val _logs = MutableStateFlow<List<AppLogEntry>>(emptyList())
@@ -99,9 +99,10 @@ class AppRepository(context: Context) {
         val next = if (current.lastOrNull()?.timestampSec == nowSec) {
             current.dropLast(1) + sample
         } else {
-            (current + sample).takeLast(720)
+            (current + sample).takeLast(MAX_RTT_SAMPLES)
         }
         _rttSamples.value = next
+        saveRttSamples(next)
     }
 
     fun appendLog(level: String, tag: String, message: String) {
@@ -314,6 +315,13 @@ class AppRepository(context: Context) {
         }
     }
 
+    private fun loadRttSamples(): List<RttSample> =
+        decodeRttSamplesJson(prefs.getString(KEY_RTT_SAMPLES, null))
+
+    private fun saveRttSamples(samples: List<RttSample>) {
+        prefs.edit { putString(KEY_RTT_SAMPLES, encodeRttSamplesJson(samples)) }
+    }
+
     private fun defaultHosts(): List<HostProfile> = listOf(
         HostProfile(
             id = "preset-lan-demo",
@@ -359,8 +367,45 @@ class AppRepository(context: Context) {
         private const val KEY_HOSTS = "hosts_json"
         private const val KEY_KEYS = "keys_json"
         private const val KEY_MACROS = "macros_json"
+        private const val KEY_RTT_SAMPLES = "rtt_samples_json"
+        private const val MAX_RTT_SAMPLES = 1440
         private const val KEY_SHIZUKU_PROMPTED = "shizuku_permission_prompted"
         private const val KEY_MIGRATED_LEGACY_TMUX_V1 = "migrated_legacy_tmux_v1"
         private const val LEGACY_AUTO_ATTACH_CMD = "tmux new-session -A -s main || true"
+
+        internal fun encodeRttSamplesJson(samples: List<RttSample>): String {
+            val array = JSONArray()
+            samples.takeLast(MAX_RTT_SAMPLES).forEach { item ->
+                array.put(
+                    JSONObject().apply {
+                        put("t", item.timestampSec)
+                        put("r", item.rttMs)
+                        put("a", item.activeSessions)
+                    }
+                )
+            }
+            return array.toString()
+        }
+
+        internal fun decodeRttSamplesJson(raw: String?): List<RttSample> {
+            if (raw.isNullOrBlank()) return emptyList()
+            return runCatching {
+                val arr = JSONArray(raw)
+                buildList(arr.length()) {
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val ts = obj.optLong("t", -1L)
+                        if (ts <= 0L) continue
+                        add(
+                            RttSample(
+                                timestampSec = ts,
+                                rttMs = obj.optLong("r", 0L).coerceAtLeast(0L),
+                                activeSessions = obj.optInt("a", 0).coerceAtLeast(0)
+                            )
+                        )
+                    }
+                }.takeLast(MAX_RTT_SAMPLES)
+            }.getOrDefault(emptyList())
+        }
     }
 }
