@@ -1,3 +1,5 @@
+> 📦 **Release 下载提示**：请前往对应的 GitLab 仓库查看或下载 Release（GitHub 端暂不重复上传）👉 [https://gitlab.com/xusu616/android_ssh_link_terminal/-/releases](https://gitlab.com/xusu616/android_ssh_link_terminal/-/releases) （[GitLab 仓库主页](https://gitlab.com/xusu616/android_ssh_link_terminal)）
+
 # SSH Link Terminal
 
 一款面向 Android 设备的 **Cyber-Glass 简洁假终端 & Shizuku 持久守护 SSH 客户端**。
