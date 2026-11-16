@@ -23,8 +23,10 @@ import com.xusu.sshlinkterminal.terminal.TerminalRenderLine
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -32,6 +34,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.OutputStream
@@ -61,6 +65,9 @@ class SshSessionController(
     initialHost: HostProfile
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val writeDispatcher = Dispatchers.IO.limitedParallelism(1)
+    private val connectMutex = Mutex()
     private val emulator = AnsiEmulator(initialCols = 80, initialRows = 28)
 
     @Volatile
@@ -126,11 +133,21 @@ class SshSessionController(
         }
         TerminalForegroundService.ensureStarted(context)
         userInitiatedStop = false
-        connectionJob?.cancel()
-        keepAliveJob?.cancel()
-        connectionJob = scope.launch {
-            runConnectionLoop()
+        val previousConnection = connectionJob
+        val previousKeepAlive = keepAliveJob
+        previousKeepAlive?.cancel()
+        previousConnection?.cancel()
+        val newJob = scope.launch {
+            // Unblock any blocking socket read before awaiting old loop teardown.
+            closeTransportOnly()
+            connectMutex.withLock {
+                previousConnection?.cancelAndJoin()
+                if (!userInitiatedStop && isActive) {
+                    runConnectionLoop()
+                }
+            }
         }
+        connectionJob = newJob
     }
 
     fun disconnect() {
@@ -160,7 +177,7 @@ class SshSessionController(
     }
 
     fun sendBytes(bytes: ByteArray) {
-        scope.launch {
+        scope.launch(writeDispatcher) {
             try {
                 shellOut?.apply {
                     write(bytes)
@@ -184,7 +201,7 @@ class SshSessionController(
         lastRows = safeRows
         emulator.resize(safeCols, safeRows)
         refreshTerminalSnapshot()
-        scope.launch {
+        scope.launch(writeDispatcher) {
             try {
                 shellChannel?.setPtySize(safeCols, safeRows, 0, 0)
             } catch (_: Throwable) {
@@ -291,15 +308,18 @@ class SshSessionController(
             }
         )
         session.setConfig("Compression", "none")
+        session.setConfig("TCPKeepAlive", "yes")
 
         val savedPassword = VaultCrypto.decrypt(host.encryptedPassword)
         if (savedPassword.isNotEmpty() && host.authType != AuthType.PUBLIC_KEY) {
             session.setPassword(savedPassword.toByteArray(StandardCharsets.UTF_8))
         }
-        val aliveSec = host.keepAliveIntervalSec.coerceIn(5, 120)
-        session.setServerAliveInterval(aliveSec * 1000)
-        session.setServerAliveCountMax(8)
-        session.timeout = maxOf(aliveSec * 1000, 25_000)
+        val aliveSec = host.keepAliveIntervalSec.coerceIn(15, 300)
+        // Use a tolerant ServerAlive budget (~15 min) without overriding SO_TIMEOUT below ServerAliveInterval,
+        // so brief screen-off / OEM freezer pauses do not tear down an otherwise healthy TCP session.
+        val serverAliveMs = maxOf(aliveSec, 45) * 1000
+        session.setServerAliveInterval(serverAliveMs)
+        session.setServerAliveCountMax(20)
 
         session.userInfo = createSshUserInfo(host, savedPassword)
 
@@ -326,12 +346,13 @@ class SshSessionController(
         )
         repository.appendLog("INFO", "SSH", "${host.name}: SSH 会话已建立")
 
-        // Start heartbeat RTT probe
+        // Start heartbeat RTT probe at a gentle cadence to populate chart telemetry without flooding idle sockets.
         keepAliveJob?.cancel()
+        val probeIntervalMs = maxOf(aliveSec, 30) * 1000L
         keepAliveJob = scope.launch {
-            while (isActive && session.isConnected) {
-                delay(aliveSec * 1000L)
-                if (!session.isConnected) break
+            while (isActive && session.isConnected && channel.isConnected) {
+                delay(probeIntervalMs)
+                if (!session.isConnected || !channel.isConnected) break
                 val start = SystemClock.elapsedRealtime()
                 try {
                     session.sendKeepAliveMsg()
@@ -342,8 +363,8 @@ class SshSessionController(
                     )
                     repository.appendRttSample(rttMs = rtt, activeSessions = 1)
                 } catch (e: Exception) {
-                    repository.appendLog("WARN", "KeepAlive", "${host.name}: 心跳失败 ${e.message}")
-                    break
+                    repository.appendLog("WARN", "KeepAlive", "${host.name}: 心跳异常 ${e.message}")
+                    if (!session.isConnected) break
                 }
             }
         }
@@ -359,14 +380,26 @@ class SshSessionController(
         }
 
         val buffer = ByteArray(8192)
+        var lastSnapshotAt = 0L
+        var dirtySnapshot = false
         while (scope.isActive && !userInitiatedStop) {
             val read = inStream.read(buffer)
             if (read < 0) break
             if (read > 0) {
                 val decoded = emulator.feedBytes(buffer, read)
                 scanTextForAuthUrls(decoded)
-                refreshTerminalSnapshot()
+                val now = SystemClock.elapsedRealtime()
+                if (inStream.available() == 0 || now - lastSnapshotAt >= 40L) {
+                    refreshTerminalSnapshot()
+                    lastSnapshotAt = now
+                    dirtySnapshot = false
+                } else {
+                    dirtySnapshot = true
+                }
             }
+        }
+        if (dirtySnapshot) {
+            refreshTerminalSnapshot()
         }
     }
 

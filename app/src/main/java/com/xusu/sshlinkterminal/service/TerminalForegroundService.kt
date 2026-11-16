@@ -45,7 +45,10 @@ class TerminalForegroundService : Service() {
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             val app = application as LinkTerminalApp
-            app.sshManager.onNetworkAvailable()
+            serviceScope.launch {
+                delay(450L)
+                app.sshManager.onNetworkAvailable()
+            }
         }
     }
 
@@ -78,6 +81,13 @@ class TerminalForegroundService : Service() {
                 app.repository.appendLog("INFO", "Daemon", "守护进程拉起并恢复常驻会话")
                 app.sshManager.restorePinnedHosts()
             }
+            null -> {
+                // START_STICKY system restart after OEM kill delivers a null intent.
+                if (app.sshManager.activeConnectedCount() == 0) {
+                    app.repository.appendLog("INFO", "Daemon", "系统重启前台服务，恢复常驻会话")
+                    app.sshManager.restorePinnedHosts()
+                }
+            }
         }
         return START_STICKY
     }
@@ -98,10 +108,21 @@ class TerminalForegroundService : Service() {
         heartbeatJob?.cancel()
         heartbeatJob = serviceScope.launch {
             val app = application as LinkTerminalApp
+            var lastSummary = ""
+            var ticks = 0
             while (isActive) {
                 app.shizukuManager.sendHeartbeat()
-                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.notify(NOTIFICATION_ID, buildNotification())
+                val activeCount = app.sshManager.activeConnectedCount()
+                val avgRtt = app.sshManager.averageRttMs()
+                val watchdog = app.shizukuManager.guardStatus.value.watchdogActive
+                val summary = "$activeCount|$avgRtt|$watchdog"
+                // Avoid re-posting identical ongoing notifications every 15s to reduce OEM freezer triggers.
+                if (summary != lastSummary || ticks % 4 == 0) {
+                    lastSummary = summary
+                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    nm.notify(NOTIFICATION_ID, buildNotification())
+                }
+                ticks++
                 delay(15_000L)
             }
         }
@@ -143,12 +164,17 @@ class TerminalForegroundService : Service() {
     private fun registerNetworkMonitor() {
         if (networkCallbackRegistered) return
         try {
-            val request = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .build()
-            connectivityManager.registerNetworkCallback(request, networkCallback)
+            connectivityManager.registerDefaultNetworkCallback(networkCallback)
             networkCallbackRegistered = true
         } catch (_: Throwable) {
+            try {
+                val request = NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build()
+                connectivityManager.registerNetworkCallback(request, networkCallback)
+                networkCallbackRegistered = true
+            } catch (_: Throwable) {
+            }
         }
     }
 

@@ -82,7 +82,8 @@ data class UiPreferences(
     val autoHardenWithShizuku: Boolean = true,
     val autoStartOnBoot: Boolean = true,
     val topComponentPressedDown: Boolean = true,
-    val chartAxisAnimation: Boolean = true
+    val chartAxisAnimation: Boolean = true,
+    val terminalNonTextInput: Boolean = true
 )
 
 data class ColorBag(

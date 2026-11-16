@@ -119,13 +119,15 @@ class AnsiEmulator(
         cursorCol = cursorCol.coerceIn(0, cols - 1)
     }
 
-    fun feedBytes(bytes: ByteArray, length: Int = bytes.size): String {
+    fun feedBytes(bytes: ByteArray, length: Int = bytes.size): String = synchronized(lock) {
+        val safeLen = length.coerceIn(0, bytes.size)
+        if (safeLen == 0 && pendingBytes.isEmpty()) return@synchronized ""
         val combined = if (pendingBytes.isEmpty()) {
-            bytes.copyOf(length)
+            bytes.copyOf(safeLen)
         } else {
-            ByteArray(pendingBytes.size + length).also {
+            ByteArray(pendingBytes.size + safeLen).also {
                 System.arraycopy(pendingBytes, 0, it, 0, pendingBytes.size)
-                System.arraycopy(bytes, 0, it, pendingBytes.size, length)
+                System.arraycopy(bytes, 0, it, pendingBytes.size, safeLen)
             }
         }
         val inBuf = ByteBuffer.wrap(combined)
@@ -139,9 +141,11 @@ class AnsiEmulator(
         outBuf.flip()
         val decoded = outBuf.toString()
         if (decoded.isNotEmpty()) {
-            feedText(decoded)
+            for (ch in decoded) {
+                processChar(ch)
+            }
         }
-        return decoded
+        decoded
     }
 
     fun feedText(text: String) = synchronized(lock) {
@@ -374,38 +378,38 @@ class AnsiEmulator(
         }
 
         when (finalChar) {
-            'A' -> cursorRow = (cursorRow - (params.firstOrNull()?.takeIf { it > 0 } ?: 1)).coerceAtLeast(0)
-            'B' -> cursorRow = (cursorRow + (params.firstOrNull()?.takeIf { it > 0 } ?: 1)).coerceAtMost(rows - 1)
-            'C' -> cursorCol = (cursorCol + (params.firstOrNull()?.takeIf { it > 0 } ?: 1)).coerceAtMost(cols - 1)
-            'D' -> cursorCol = (cursorCol - (params.firstOrNull()?.takeIf { it > 0 } ?: 1)).coerceAtLeast(0)
+            'A' -> cursorRow = (cursorRow - (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, rows - 1)
+            'B' -> cursorRow = (cursorRow + (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, rows - 1)
+            'C' -> cursorCol = (cursorCol + (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, cols - 1)
+            'D' -> cursorCol = (cursorCol - (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, cols - 1)
             'E' -> {
-                cursorRow = (cursorRow + (params.firstOrNull()?.takeIf { it > 0 } ?: 1)).coerceAtMost(rows - 1)
+                cursorRow = (cursorRow + (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, rows - 1)
                 cursorCol = 0
             }
             'F' -> {
-                cursorRow = (cursorRow - (params.firstOrNull()?.takeIf { it > 0 } ?: 1)).coerceAtLeast(0)
+                cursorRow = (cursorRow - (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, rows - 1)
                 cursorCol = 0
             }
             'G', '`' -> {
-                val targetCol = (params.firstOrNull()?.takeIf { it > 0 } ?: 1) - 1
+                val targetCol = (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1) - 1
                 cursorCol = targetCol.coerceIn(0, cols - 1)
             }
             'd' -> {
-                val targetRow = (params.firstOrNull()?.takeIf { it > 0 } ?: 1) - 1
+                val targetRow = (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1) - 1
                 cursorRow = targetRow.coerceIn(0, rows - 1)
             }
             'H', 'f' -> {
-                val r = (params.getOrNull(0)?.takeIf { it > 0 } ?: 1) - 1
-                val c = (params.getOrNull(1)?.takeIf { it > 0 } ?: 1) - 1
+                val r = (params.getOrNull(0)?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1) - 1
+                val c = (params.getOrNull(1)?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1) - 1
                 cursorRow = r.coerceIn(0, rows - 1)
                 cursorCol = c.coerceIn(0, cols - 1)
             }
             'J' -> eraseDisplay(params.firstOrNull() ?: 0)
             'K' -> eraseLine(params.firstOrNull() ?: 0)
-            'L' -> insertLines(params.firstOrNull()?.takeIf { it > 0 } ?: 1)
-            'M' -> deleteLines(params.firstOrNull()?.takeIf { it > 0 } ?: 1)
-            'P' -> deleteChars(params.firstOrNull()?.takeIf { it > 0 } ?: 1)
-            'X' -> eraseChars(params.firstOrNull()?.takeIf { it > 0 } ?: 1)
+            'L' -> insertLines(params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(rows) ?: 1)
+            'M' -> deleteLines(params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(rows) ?: 1)
+            'P' -> deleteChars(params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(cols) ?: 1)
+            'X' -> eraseChars(params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(cols) ?: 1)
             'r' -> {
                 val top = ((params.getOrNull(0)?.takeIf { it > 0 } ?: 1) - 1).coerceIn(0, rows - 1)
                 val bottom = ((params.getOrNull(1)?.takeIf { it > 0 } ?: rows) - 1).coerceIn(0, rows - 1)

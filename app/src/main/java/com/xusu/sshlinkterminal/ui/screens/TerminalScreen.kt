@@ -2,6 +2,8 @@ package com.xusu.sshlinkterminal.ui.screens
 
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.text.InputType
+import android.view.inputmethod.EditorInfo
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -89,6 +91,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
@@ -109,10 +112,13 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.InterceptPlatformTextInput
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.PlatformTextInputInterceptor
+import androidx.compose.ui.platform.PlatformTextInputMethodRequest
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
@@ -275,7 +281,7 @@ fun TerminalScreen(
             val totalItems = listState.layoutInfo.totalItemsCount
             val visibleItems = listState.layoutInfo.visibleItemsInfo.size
             if (totalItems > visibleItems || visibleItems == 0) {
-                listState.scrollToItem(lines.lastIndex, Int.MAX_VALUE)
+                listState.scrollToItem(lines.lastIndex, 4_096)
             }
         }
     }
@@ -634,84 +640,143 @@ fun TerminalScreen(
                     if ((authLink != null || showQuickBar || isImeVisible) && lines.isNotEmpty() && followBottom) {
                         val contentPx = lines.size * metrics.lineHeightPx + verticalPadPx
                         if (contentPx > heightPx) {
-                            listState.scrollToItem(lines.lastIndex, Int.MAX_VALUE)
+                            listState.scrollToItem(lines.lastIndex, 4_096)
                         }
                     }
                 }
 
-                // Invisible IME input capture field
-                BasicTextField(
-                    value = imeValue,
-                    onValueChange = { next ->
-                        if (next.composition != null) {
-                            imeValue = next
-                        } else {
-                            when {
-                                next.text.isEmpty() -> sendWithModifiers("\u007F")
-                                next.text.startsWith(IME_SENTINEL) -> {
-                                    val added = next.text.substring(IME_SENTINEL.length)
-                                    if (added.isNotEmpty()) {
-                                        sendWithModifiers(added)
-                                    }
-                                }
-                                else -> sendWithModifiers(next.text)
+                // Invisible IME input capture field (optionally forces Termux-like TYPE_NULL raw input)
+                @OptIn(ExperimentalComposeUiApi::class)
+                val terminalInputInterceptor = remember(uiPreferences.terminalNonTextInput) {
+                    PlatformTextInputInterceptor { request, nextHandler ->
+                        val wrappedRequest = PlatformTextInputMethodRequest { outAttributes ->
+                            val conn = request.createInputConnection(outAttributes)
+                            if (uiPreferences.terminalNonTextInput) {
+                                outAttributes.inputType = InputType.TYPE_NULL
+                                outAttributes.imeOptions = outAttributes.imeOptions or
+                                    EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+                                    EditorInfo.IME_FLAG_NO_FULLSCREEN
                             }
-                            resetImeBuffer()
+                            conn
                         }
-                    },
-                    keyboardOptions = KeyboardOptions(
-                        imeAction = ImeAction.Send,
-                        autoCorrectEnabled = false
-                    ),
-                    keyboardActions = KeyboardActions(
-                        onSend = { sendWithModifiers("\r") }
-                    ),
-                    modifier = Modifier
-                        .size(1.dp)
-                        .alpha(0f)
-                        .focusRequester(focusRequester)
-                        .onPreviewKeyEvent { event ->
-                            if (event.type == KeyEventType.KeyDown) {
-                                when (event.key) {
-                                    Key.Enter -> {
-                                        sendWithModifiers("\r")
-                                        true
-                                    }
-                                    Key.Backspace -> {
-                                        sendWithModifiers("\u007F")
-                                        true
-                                    }
-                                    Key.Tab -> {
-                                        sendWithModifiers("\t")
-                                        true
-                                    }
-                                    Key.Escape -> {
-                                        sendWithModifiers("\u001B")
-                                        true
-                                    }
-                                    Key.DirectionUp -> {
-                                        sendWithModifiers("\u001B[A")
-                                        true
-                                    }
-                                    Key.DirectionDown -> {
-                                        sendWithModifiers("\u001B[B")
-                                        true
-                                    }
-                                    Key.DirectionLeft -> {
-                                        sendWithModifiers("\u001B[D")
-                                        true
-                                    }
-                                    Key.DirectionRight -> {
-                                        sendWithModifiers("\u001B[C")
-                                        true
-                                    }
-                                    else -> false
-                                }
+                        nextHandler.startInputMethod(wrappedRequest)
+                    }
+                }
+
+                @OptIn(ExperimentalComposeUiApi::class)
+                InterceptPlatformTextInput(interceptor = terminalInputInterceptor) {
+                    BasicTextField(
+                        value = imeValue,
+                        onValueChange = { next ->
+                            if (!uiPreferences.terminalNonTextInput && next.composition != null) {
+                                imeValue = next
                             } else {
-                                false
+                                when {
+                                    next.text.isEmpty() -> sendWithModifiers("\u007F")
+                                    next.text.startsWith(IME_SENTINEL) -> {
+                                        val added = next.text.substring(IME_SENTINEL.length)
+                                        if (added.isNotEmpty()) {
+                                            sendWithModifiers(added)
+                                        }
+                                    }
+                                    else -> sendWithModifiers(next.text)
+                                }
+                                resetImeBuffer()
                             }
-                        }
-                )
+                        },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = if (uiPreferences.terminalNonTextInput) KeyboardType.Ascii else KeyboardType.Text,
+                            imeAction = ImeAction.Send,
+                            autoCorrectEnabled = false
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onSend = { sendWithModifiers("\r") }
+                        ),
+                        modifier = Modifier
+                            .size(1.dp)
+                            .alpha(0f)
+                            .focusRequester(focusRequester)
+                            .onPreviewKeyEvent { event ->
+                                if (event.type == KeyEventType.KeyDown) {
+                                    val native = event.nativeKeyEvent
+                                    if (native.isCtrlPressed || native.isAltPressed) {
+                                        val keyChar = when {
+                                            native.keyCode in android.view.KeyEvent.KEYCODE_A..android.view.KeyEvent.KEYCODE_Z ->
+                                                ('a' + (native.keyCode - android.view.KeyEvent.KEYCODE_A)).toString()
+                                            native.unicodeChar > 0 -> (native.unicodeChar and 0xFFFF).toChar().toString()
+                                            else -> ""
+                                        }
+                                        if (keyChar.isNotEmpty()) {
+                                            var seq = keyChar
+                                            if (native.isCtrlPressed) {
+                                                val upper = seq[0].uppercaseChar()
+                                                if (upper in '@'..'_' || seq[0] in 'a'..'z') {
+                                                    seq = (upper.code - '@'.code).toChar().toString()
+                                                }
+                                            }
+                                            if (native.isAltPressed) {
+                                                seq = "\u001B$seq"
+                                            }
+                                            currentHost?.id?.let { onSendText(it, seq) }
+                                            ctrlLocked = false
+                                            altLocked = false
+                                            return@onPreviewKeyEvent true
+                                        }
+                                    }
+                                    when (event.key) {
+                                        Key.Enter -> {
+                                            sendWithModifiers("\r")
+                                            true
+                                        }
+                                        Key.Backspace -> {
+                                            sendWithModifiers("\u007F")
+                                            true
+                                        }
+                                        Key.Delete -> {
+                                            sendWithModifiers("\u001B[3~")
+                                            true
+                                        }
+                                        Key.MoveHome -> {
+                                            sendWithModifiers("\u001B[H")
+                                            true
+                                        }
+                                        Key.MoveEnd -> {
+                                            sendWithModifiers("\u001B[F")
+                                            true
+                                        }
+                                        Key.Tab -> {
+                                            sendWithModifiers("\t")
+                                            true
+                                        }
+                                        Key.Escape -> {
+                                            sendWithModifiers("\u001B")
+                                            true
+                                        }
+                                        Key.DirectionUp -> {
+                                            sendWithModifiers("\u001B[A")
+                                            true
+                                        }
+                                        Key.DirectionDown -> {
+                                            sendWithModifiers("\u001B[B")
+                                            true
+                                        }
+                                        Key.DirectionLeft -> {
+                                            sendWithModifiers("\u001B[D")
+                                            true
+                                        }
+                                        Key.DirectionRight -> {
+                                            sendWithModifiers("\u001B[C")
+                                            true
+                                        }
+                                        else -> false
+                                    }
+                                } else {
+                                    false
+                                }
+                            }
+                    )
+                }
 
                 val hScrollState = rememberScrollState()
                 val requiredContentWidthPx = remember(revision, lines.size, cols, metrics, widthPx, horizontalPadPx) {

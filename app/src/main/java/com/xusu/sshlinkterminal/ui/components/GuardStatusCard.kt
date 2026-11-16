@@ -136,7 +136,7 @@ fun GuardStatusOverlay(
                                     fontWeight = FontWeight.Bold
                                 )
                                 Text(
-                                    "解决锁后台仍被系统回收导致 SSH/OAuth 中断",
+                                    "OPPO/一加等系统请额外点右下「自启动/省电 -> 耗电管理」开启“允许完全后台行为”，防止切出后台数秒后被墓碑冻结断连",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )

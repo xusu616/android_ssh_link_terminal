@@ -70,4 +70,13 @@ class AnsiEmulatorTest {
         assertEquals(1, lines.size)
         assertEquals("AB中文CD", lines[0].plainText)
     }
+
+    @Test
+    fun `clamps extreme CSI movement and erase parameters without overflow`() {
+        val emulator = AnsiEmulator(initialCols = 20, initialRows = 6)
+        emulator.feedText("hello")
+        emulator.feedText("\u001B[2147483647B\u001B[2147483647C\u001B[2147483647P!")
+        val lines = emulator.snapshotLines().map { it.plainText }
+        assertTrue(lines.any { it.contains("!") })
+    }
 }

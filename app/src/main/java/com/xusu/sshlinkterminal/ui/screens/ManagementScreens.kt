@@ -669,7 +669,13 @@ fun AppearanceSettingsScreen(
                         .padding(14.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Text("终端字体与排版", fontWeight = FontWeight.Bold)
+                    Text("终端输入、字体与排版", fontWeight = FontWeight.Bold)
+                    PrefSwitchRow(
+                        title = "非文本直输模式（类似 Termux）",
+                        subtitle = "将终端输入设置为非文本类型（TYPE_NULL），阻止英文输入法弹出候选框与联想词；需中文输入可使用右上角“命令行输入”",
+                        checked = prefs.terminalNonTextInput,
+                        onCheckedChange = { checked -> onUpdatePrefs { it.copy(terminalNonTextInput = checked) } }
+                    )
                     PrefSwitchRow(
                         title = "终端使用等宽字体",
                         subtitle = "开启后按等宽网格对齐 ASCII 图形；关闭则使用系统默认字体自然排版",

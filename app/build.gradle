@@ -69,6 +69,18 @@ def resolveVersion = {
     }
 }
 
+def localPropsFile = rootProject.file('local.properties')
+def localProps = new Properties()
+if (localPropsFile.canRead()) {
+    localPropsFile.withInputStream { localProps.load(it) }
+}
+def releaseStoreFilePath = (localProps.getProperty('RELEASE_STORE_FILE') ?: System.getenv('RELEASE_STORE_FILE'))?.trim()
+def releaseStorePassword = (localProps.getProperty('RELEASE_STORE_PASSWORD') ?: System.getenv('RELEASE_STORE_PASSWORD'))?.trim()
+def releaseKeyAlias = (localProps.getProperty('RELEASE_KEY_ALIAS') ?: System.getenv('RELEASE_KEY_ALIAS'))?.trim()
+def releaseKeyPassword = (localProps.getProperty('RELEASE_KEY_PASSWORD') ?: System.getenv('RELEASE_KEY_PASSWORD'))?.trim()
+def hasReleaseSigning = releaseStoreFilePath && file(releaseStoreFilePath).isFile() &&
+    releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+
 android {
     namespace = "com.xusu.sshlinkterminal"
     compileSdk = libs.versions.compileSdk.get().toInteger()
@@ -83,6 +95,17 @@ android {
         targetSdk = libs.versions.targetSdk.get().toInteger()
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile file(releaseStoreFilePath)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         debug {
             debuggable = true
@@ -93,6 +116,9 @@ android {
         release {
             minifyEnabled = true
             shrinkResources = true
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }

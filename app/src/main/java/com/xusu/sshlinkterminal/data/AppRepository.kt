@@ -5,6 +5,7 @@ import androidx.core.content.edit
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -27,7 +28,7 @@ class AppRepository(context: Context) {
     private val _rttSamples = MutableStateFlow(loadRttSamples())
     val rttSamples: StateFlow<List<RttSample>> = _rttSamples.asStateFlow()
 
-    private val _logs = MutableStateFlow<List<AppLogEntry>>(emptyList())
+    private val _logs = MutableStateFlow(loadLogs())
     val logs: StateFlow<List<AppLogEntry>> = _logs.asStateFlow()
 
     fun upsertHost(host: HostProfile) {
@@ -95,23 +96,32 @@ class AppRepository(context: Context) {
     fun appendRttSample(rttMs: Long, activeSessions: Int) {
         val nowSec = System.currentTimeMillis() / 1000L
         val sample = RttSample(nowSec, rttMs.coerceAtLeast(0L), activeSessions)
-        val current = _rttSamples.value
-        val next = if (current.lastOrNull()?.timestampSec == nowSec) {
-            current.dropLast(1) + sample
-        } else {
-            (current + sample).takeLast(MAX_RTT_SAMPLES)
+        var snapshot: List<RttSample> = emptyList()
+        _rttSamples.update { current ->
+            val next = if (current.lastOrNull()?.timestampSec == nowSec) {
+                current.dropLast(1) + sample
+            } else {
+                (current + sample).takeLast(MAX_RTT_SAMPLES)
+            }
+            snapshot = next
+            next
         }
-        _rttSamples.value = next
-        saveRttSamples(next)
+        saveRttSamples(snapshot)
     }
 
     fun appendLog(level: String, tag: String, message: String) {
-        val next = (_logs.value + AppLogEntry(level = level, tag = tag, message = message)).takeLast(300)
-        _logs.value = next
+        var snapshot: List<AppLogEntry> = emptyList()
+        _logs.update { current ->
+            val next = (current + AppLogEntry(level = level, tag = tag, message = message)).takeLast(300)
+            snapshot = next
+            next
+        }
+        saveLogs(snapshot)
     }
 
     fun clearLogs() {
         _logs.value = emptyList()
+        prefs.edit { remove(KEY_LOGS) }
     }
 
     fun hasPromptedShizukuPermission(): Boolean =
@@ -287,7 +297,8 @@ class AppRepository(context: Context) {
             autoHardenWithShizuku = prefs.getBoolean("ui_auto_harden_shizuku", true),
             autoStartOnBoot = prefs.getBoolean("ui_auto_start_boot", true),
             topComponentPressedDown = prefs.getBoolean("ui_top_pressed_down", true),
-            chartAxisAnimation = prefs.getBoolean("ui_chart_axis_anim", true)
+            chartAxisAnimation = prefs.getBoolean("ui_chart_axis_anim", true),
+            terminalNonTextInput = prefs.getBoolean("ui_terminal_non_text_input", true)
         )
     }
 
@@ -312,6 +323,7 @@ class AppRepository(context: Context) {
             putBoolean("ui_auto_start_boot", value.autoStartOnBoot)
             putBoolean("ui_top_pressed_down", value.topComponentPressedDown)
             putBoolean("ui_chart_axis_anim", value.chartAxisAnimation)
+            putBoolean("ui_terminal_non_text_input", value.terminalNonTextInput)
         }
     }
 
@@ -320,6 +332,13 @@ class AppRepository(context: Context) {
 
     private fun saveRttSamples(samples: List<RttSample>) {
         prefs.edit { putString(KEY_RTT_SAMPLES, encodeRttSamplesJson(samples)) }
+    }
+
+    private fun loadLogs(): List<AppLogEntry> =
+        decodeLogsJson(prefs.getString(KEY_LOGS, null))
+
+    private fun saveLogs(entries: List<AppLogEntry>) {
+        prefs.edit { putString(KEY_LOGS, encodeLogsJson(entries)) }
     }
 
     private fun defaultHosts(): List<HostProfile> = listOf(
@@ -369,9 +388,48 @@ class AppRepository(context: Context) {
         private const val KEY_MACROS = "macros_json"
         private const val KEY_RTT_SAMPLES = "rtt_samples_json"
         private const val MAX_RTT_SAMPLES = 1440
+        private const val KEY_LOGS = "logs_json"
+        private const val MAX_PERSISTED_LOGS = 120
         private const val KEY_SHIZUKU_PROMPTED = "shizuku_permission_prompted"
         private const val KEY_MIGRATED_LEGACY_TMUX_V1 = "migrated_legacy_tmux_v1"
         private const val LEGACY_AUTO_ATTACH_CMD = "tmux new-session -A -s main || true"
+
+        internal fun encodeLogsJson(entries: List<AppLogEntry>): String {
+            val array = JSONArray()
+            entries.takeLast(MAX_PERSISTED_LOGS).forEach { item ->
+                array.put(
+                    JSONObject().apply {
+                        put("ts", item.timestampMillis)
+                        put("lvl", item.level)
+                        put("tag", item.tag)
+                        put("msg", item.message)
+                    }
+                )
+            }
+            return array.toString()
+        }
+
+        internal fun decodeLogsJson(raw: String?): List<AppLogEntry> {
+            if (raw.isNullOrBlank()) return emptyList()
+            return runCatching {
+                val arr = JSONArray(raw)
+                buildList(arr.length()) {
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val msg = obj.optString("msg", "")
+                        if (msg.isEmpty()) continue
+                        add(
+                            AppLogEntry(
+                                timestampMillis = obj.optLong("ts", System.currentTimeMillis()),
+                                level = obj.optString("lvl", "INFO"),
+                                tag = obj.optString("tag", "App"),
+                                message = msg
+                            )
+                        )
+                    }
+                }.takeLast(MAX_PERSISTED_LOGS)
+            }.getOrDefault(emptyList())
+        }
 
         internal fun encodeRttSamplesJson(samples: List<RttSample>): String {
             val array = JSONArray()
