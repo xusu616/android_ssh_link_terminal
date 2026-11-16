@@ -289,6 +289,8 @@ class AppRepository(context: Context) {
             terminalFontPreset = prefs.getString("ui_terminal_font_preset", "AUTO") ?: "AUTO",
             terminalCustomFontPath = prefs.getString("ui_terminal_custom_font_path", null),
             terminalCustomFontName = prefs.getString("ui_terminal_custom_font_name", null),
+            terminalNerdIconsEnabled = prefs.getBoolean("ui_terminal_nerd_icons_enabled", true),
+            terminalNerdIconsPath = prefs.getString("ui_terminal_nerd_icons_path", null),
             terminalHorizontalScroll = prefs.getBoolean("ui_terminal_hscroll", true),
             accentDepth = prefs.getFloat("ui_accent_depth", 0.28f),
             autoOpenOAuthUrl = prefs.getBoolean("ui_auto_open_oauth", true),
@@ -314,6 +316,8 @@ class AppRepository(context: Context) {
             putString("ui_terminal_font_preset", value.terminalFontPreset)
             putString("ui_terminal_custom_font_path", value.terminalCustomFontPath)
             putString("ui_terminal_custom_font_name", value.terminalCustomFontName)
+            putBoolean("ui_terminal_nerd_icons_enabled", value.terminalNerdIconsEnabled)
+            putString("ui_terminal_nerd_icons_path", value.terminalNerdIconsPath)
             putBoolean("ui_terminal_hscroll", value.terminalHorizontalScroll)
             putFloat("ui_accent_depth", value.accentDepth)
             putBoolean("ui_auto_open_oauth", value.autoOpenOAuthUrl)

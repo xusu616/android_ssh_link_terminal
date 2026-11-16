@@ -38,7 +38,8 @@ private data class Cell(
 class AnsiEmulator(
     initialCols: Int = 80,
     initialRows: Int = 24,
-    private val maxScrollback: Int = 1800
+    private val maxScrollback: Int = 1800,
+    private val onTerminalResponse: ((String) -> Unit)? = null
 ) {
     var cols: Int = initialCols.coerceIn(20, 240)
         private set
@@ -62,7 +63,16 @@ class AnsiEmulator(
     private var scrollTop = 0
     private var scrollBottom = rows - 1
 
-    private enum class ParserState { TEXT, ESC, CSI, OSC, OSC_ESC }
+    private enum class ParserState {
+        TEXT,
+        ESC,
+        ESC_INTERMEDIATE,
+        CSI,
+        OSC,
+        OSC_ESC,
+        STRING_ST,
+        STRING_ST_ESC
+    }
 
     private var state = ParserState.TEXT
     private val csiBuf = StringBuilder()
@@ -75,6 +85,7 @@ class AnsiEmulator(
     private var pendingBytes = ByteArray(0)
 
     private val lock = Any()
+    private val responseQueue = ArrayList<String>(4)
 
     fun resize(newCols: Int, newRows: Int): Unit = synchronized(lock) {
         val targetCols = newCols.coerceIn(20, 240)
@@ -119,39 +130,73 @@ class AnsiEmulator(
         cursorCol = cursorCol.coerceIn(0, cols - 1)
     }
 
-    fun feedBytes(bytes: ByteArray, length: Int = bytes.size): String = synchronized(lock) {
-        val safeLen = length.coerceIn(0, bytes.size)
-        if (safeLen == 0 && pendingBytes.isEmpty()) return@synchronized ""
-        val combined = if (pendingBytes.isEmpty()) {
-            bytes.copyOf(safeLen)
-        } else {
-            ByteArray(pendingBytes.size + safeLen).also {
-                System.arraycopy(pendingBytes, 0, it, 0, pendingBytes.size)
-                System.arraycopy(bytes, 0, it, pendingBytes.size, safeLen)
+    fun feedBytes(bytes: ByteArray, length: Int = bytes.size): String {
+        var responses: List<String> = emptyList()
+        val decoded = synchronized(lock) {
+            val safeLen = length.coerceIn(0, bytes.size)
+            if (safeLen == 0 && pendingBytes.isEmpty()) return@synchronized ""
+            val combined = if (pendingBytes.isEmpty()) {
+                bytes.copyOf(safeLen)
+            } else {
+                ByteArray(pendingBytes.size + safeLen).also {
+                    System.arraycopy(pendingBytes, 0, it, 0, pendingBytes.size)
+                    System.arraycopy(bytes, 0, it, pendingBytes.size, safeLen)
+                }
             }
-        }
-        val inBuf = ByteBuffer.wrap(combined)
-        val outBuf = CharBuffer.allocate(combined.size * 2 + 4)
-        utf8Decoder.decode(inBuf, outBuf, false)
-        pendingBytes = if (inBuf.hasRemaining()) {
-            ByteArray(inBuf.remaining()).also { inBuf.get(it) }
-        } else {
-            ByteArray(0)
-        }
-        outBuf.flip()
-        val decoded = outBuf.toString()
-        if (decoded.isNotEmpty()) {
-            for (ch in decoded) {
-                processChar(ch)
+            val inBuf = ByteBuffer.wrap(combined)
+            val outBuf = CharBuffer.allocate(combined.size * 2 + 4)
+            utf8Decoder.decode(inBuf, outBuf, false)
+            pendingBytes = if (inBuf.hasRemaining()) {
+                ByteArray(inBuf.remaining()).also { inBuf.get(it) }
+            } else {
+                ByteArray(0)
             }
+            outBuf.flip()
+            val text = outBuf.toString()
+            if (text.isNotEmpty()) {
+                for (ch in text) {
+                    processChar(ch)
+                }
+            }
+            responses = drainResponsesLocked()
+            text
         }
-        decoded
+        responses.forEach { onTerminalResponse?.invoke(it) }
+        return decoded
     }
 
-    fun feedText(text: String) = synchronized(lock) {
-        for (ch in text) {
-            processChar(ch)
+    fun feedText(text: String) {
+        val responses = synchronized(lock) {
+            for (ch in text) {
+                processChar(ch)
+            }
+            drainResponsesLocked()
         }
+        responses.forEach { onTerminalResponse?.invoke(it) }
+    }
+
+    private fun drainResponsesLocked(): List<String> {
+        if (responseQueue.isEmpty()) return emptyList()
+        val copy = responseQueue.toList()
+        responseQueue.clear()
+        return copy
+    }
+
+    private fun enqueueResponse(response: String) {
+        if (onTerminalResponse != null && responseQueue.size < 256) {
+            responseQueue.add(response)
+        }
+    }
+
+    private fun resetParserLocked() {
+        state = ParserState.TEXT
+        csiBuf.setLength(0)
+        oscBuf.setLength(0)
+        pendingBytes = ByteArray(0)
+    }
+
+    fun resetParserState() = synchronized(lock) {
+        resetParserLocked()
     }
 
     fun clear() = synchronized(lock) {
@@ -161,9 +206,14 @@ class AnsiEmulator(
         usingAltScreen = false
         cursorRow = 0
         cursorCol = 0
+        savedCursorRow = 0
+        savedCursorCol = 0
         scrollTop = 0
         scrollBottom = rows - 1
         currentStyle = TerminalStyle()
+        currentOscLink = null
+        windowTitle = ""
+        resetParserLocked()
     }
 
     fun snapshotLines(): List<TerminalRenderLine> = synchronized(lock) {
@@ -241,6 +291,11 @@ class AnsiEmulator(
                     oscBuf.setLength(0)
                     state = ParserState.OSC
                 }
+                'P', '_', '^', 'X' -> {
+                    // DCS / APC / PM / SOS strings terminated cleanly by ST or BEL
+                    oscBuf.setLength(0)
+                    state = ParserState.STRING_ST
+                }
                 '7' -> {
                     savedCursorRow = cursorRow
                     savedCursorCol = cursorCol
@@ -255,47 +310,114 @@ class AnsiEmulator(
                     reverseIndex()
                     state = ParserState.TEXT
                 }
+                'Z' -> {
+                    // Legacy VT100 DECID -> respond with Primary Device Attributes
+                    enqueueResponse("\u001B[?62;22c")
+                    state = ParserState.TEXT
+                }
                 'c' -> {
                     clear()
                     state = ParserState.TEXT
                 }
-                '(', ')' -> state = ParserState.TEXT // Charset designation ignored cleanly
+                in '\u0020'..'\u002F' -> {
+                    // ECMA-48 intermediate bytes such as ESC ( B / ESC ) 0 / ESC # 8
+                    state = ParserState.ESC_INTERMEDIATE
+                }
                 else -> state = ParserState.TEXT
             }
 
-            ParserState.CSI -> {
-                if (ch.code in 0x40..0x7E) {
-                    executeCsi(csiBuf.toString(), ch)
+            ParserState.ESC_INTERMEDIATE -> {
+                if (ch == '\u001B') {
+                    state = ParserState.ESC
+                } else if (ch == '\u0018' || ch == '\u001A') {
                     state = ParserState.TEXT
-                } else {
-                    csiBuf.append(ch)
+                } else if (ch.code !in 0x20..0x2F) {
+                    // Consume final byte and return cleanly to TEXT
+                    state = ParserState.TEXT
                 }
             }
 
-            ParserState.OSC -> when (ch) {
-                '\u0007' -> {
+            ParserState.CSI -> when {
+                ch == '\u001B' -> {
+                    csiBuf.setLength(0)
+                    state = ParserState.ESC
+                }
+                ch == '\u0018' || ch == '\u001A' -> {
+                    csiBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+                ch.code in 0x40..0x7E -> {
+                    executeCsi(csiBuf.toString(), ch)
+                    csiBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+                csiBuf.length < 256 -> csiBuf.append(ch)
+            }
+
+            ParserState.OSC -> when {
+                ch == '\u0007' -> {
                     executeOsc(oscBuf.toString())
+                    oscBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+                ch == '\u001B' -> state = ParserState.OSC_ESC
+                ch == '\u0018' || ch == '\u001A' -> {
+                    oscBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+                oscBuf.length < 4096 -> oscBuf.append(ch)
+                else -> {
+                    oscBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+            }
+
+            ParserState.OSC_ESC -> when (ch) {
+                '\\' -> {
+                    executeOsc(oscBuf.toString())
+                    oscBuf.setLength(0)
                     state = ParserState.TEXT
                 }
                 '\u001B' -> state = ParserState.OSC_ESC
-                else -> oscBuf.append(ch)
+                else -> {
+                    if (oscBuf.length < 4094) {
+                        oscBuf.append('\u001B').append(ch)
+                        state = ParserState.OSC
+                    } else {
+                        oscBuf.setLength(0)
+                        state = ParserState.TEXT
+                    }
+                }
             }
 
-            ParserState.OSC_ESC -> {
-                if (ch == '\\') {
-                    executeOsc(oscBuf.toString())
+            ParserState.STRING_ST -> when {
+                ch == '\u0007' || ch == '\u0018' || ch == '\u001A' -> {
+                    oscBuf.setLength(0)
                     state = ParserState.TEXT
-                } else {
-                    oscBuf.append('\u001B').append(ch)
-                    state = ParserState.OSC
                 }
+                ch == '\u001B' -> state = ParserState.STRING_ST_ESC
+                oscBuf.length < 8192 -> oscBuf.append(ch)
+                else -> {
+                    oscBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+            }
+
+            ParserState.STRING_ST_ESC -> when (ch) {
+                '\\' -> {
+                    oscBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+                '\u001B' -> state = ParserState.STRING_ST_ESC
+                else -> state = ParserState.STRING_ST
             }
         }
     }
 
     private fun putChar(ch: Char) {
         val wide = isWideChar(ch)
-        if (wide && cursorCol >= cols - 1) {
+        val reserveTwoCells = wide || Character.isHighSurrogate(ch)
+        if (reserveTwoCells && cursorCol >= cols - 1) {
             if (cursorCol < cols) {
                 activeScreen()[cursorRow][cursorCol] = Cell()
             }
@@ -306,7 +428,9 @@ class AnsiEmulator(
             lineFeed()
         }
         val row = activeScreen()[cursorRow]
-        if (row[cursorCol].isWideTrail && cursorCol > 0) {
+        if (cursorCol > 0 && (row[cursorCol].isWideTrail ||
+                (Character.isLowSurrogate(row[cursorCol].ch) && Character.isHighSurrogate(row[cursorCol - 1].ch)))
+        ) {
             row[cursorCol - 1] = Cell()
         }
         row[cursorCol] = Cell(ch = ch, style = currentStyle, oscLink = currentOscLink, isWideTrail = false)
@@ -361,9 +485,24 @@ class AnsiEmulator(
     }
 
     private fun executeCsi(rawParams: String, finalChar: Char) {
+        if (rawParams.startsWith(">")) {
+            when (finalChar) {
+                'c' -> enqueueResponse("\u001B[>0;10;1c") // Secondary Device Attributes (DA2)
+                'q' -> enqueueResponse("\u001BP>|LinkTerm(1.0.8)\u001B\\") // XTVERSION
+            }
+            return
+        }
+        if (rawParams.startsWith("<") || rawParams.startsWith("=")) {
+            // Private Kitty / DA3 prefixes must not leak into standard VT CSI commands
+            return
+        }
+
         val isPrivate = rawParams.startsWith("?")
         val clean = if (isPrivate) rawParams.substring(1) else rawParams
-        val params = if (clean.isEmpty()) emptyList() else clean.split(';').map { it.toIntOrNull() ?: 0 }
+        val hasDollarIntermediate = clean.endsWith("$")
+        val paramBody = if (hasDollarIntermediate) clean.dropLast(1) else clean
+        val rawTokens = if (paramBody.isEmpty()) emptyList() else paramBody.split(';')
+        val params = rawTokens.map { it.toIntOrNull() ?: 0 }
 
         if (isPrivate) {
             when (finalChar) {
@@ -373,11 +512,38 @@ class AnsiEmulator(
                 'l' -> params.forEach { p ->
                     if (p == 1049 || p == 1047 || p == 47) switchToAltScreen(false)
                 }
+                'n' -> {
+                    if (params.firstOrNull() == 6) {
+                        enqueueResponse("\u001B[?${cursorRow + 1};${cursorCol + 1}R")
+                    }
+                }
+                'p' -> if (hasDollarIntermediate) {
+                    val mode = params.firstOrNull() ?: 0
+                    enqueueResponse("\u001B[?$mode;0\$y") // DECRPM: mode not recognized / unset
+                }
             }
             return
         }
 
+        if (hasDollarIntermediate && finalChar == 'p') {
+            val mode = params.firstOrNull() ?: 0
+            enqueueResponse("\u001B[$mode;0\$y") // Standard ANSI DECRQM
+            return
+        }
+
         when (finalChar) {
+            'c' -> {
+                // Primary Device Attributes (DA1): VT220 + ANSI Color (prevents Fish 4.x 10s query timeout)
+                if (params.isEmpty() || params.firstOrNull() == 0) {
+                    enqueueResponse("\u001B[?62;22c")
+                }
+            }
+            'n' -> {
+                when (params.firstOrNull()) {
+                    5 -> enqueueResponse("\u001B[0n") // DSR: Terminal OK
+                    6 -> enqueueResponse("\u001B[${cursorRow + 1};${cursorCol + 1}R") // CPR: Cursor Position Report
+                }
+            }
             'A' -> cursorRow = (cursorRow - (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, rows - 1)
             'B' -> cursorRow = (cursorRow + (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, rows - 1)
             'C' -> cursorCol = (cursorCol + (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, cols - 1)
@@ -420,7 +586,7 @@ class AnsiEmulator(
                     cursorCol = 0
                 }
             }
-            'm' -> applySgr(if (params.isEmpty()) listOf(0) else params)
+            'm' -> applySgrTokens(if (rawTokens.isEmpty()) listOf("0") else rawTokens)
             's' -> {
                 savedCursorRow = cursorRow
                 savedCursorCol = cursorCol
@@ -525,6 +691,50 @@ class AnsiEmulator(
         }
     }
 
+    private fun applySgrTokens(tokens: List<String>) {
+        val expanded = ArrayList<Int>(tokens.size)
+        for (tok in tokens) {
+            if (tok.isEmpty()) {
+                expanded.add(0)
+                continue
+            }
+            if (':' in tok) {
+                val subs = tok.split(':')
+                val head = subs.getOrNull(0)?.toIntOrNull() ?: continue
+                when (head) {
+                    4 -> {
+                        val sub = subs.getOrNull(1)?.toIntOrNull() ?: 1
+                        expanded.add(if (sub == 0) 24 else 4)
+                    }
+                    38, 48 -> {
+                        val mode = subs.getOrNull(1)?.toIntOrNull()
+                        if (mode == 5 && subs.size >= 3) {
+                            val idx = subs[2].toIntOrNull() ?: continue
+                            expanded.add(head)
+                            expanded.add(5)
+                            expanded.add(idx)
+                        } else if (mode == 2) {
+                            // Supports both ISO 8613-6 `38:2:csId:R:G:B` (5+ subparams) and `38:2:R:G:B` (4 subparams)
+                            val rgbStart = if (subs.size >= 6) 3 else 2
+                            val r = subs.getOrNull(rgbStart)?.toIntOrNull() ?: continue
+                            val g = subs.getOrNull(rgbStart + 1)?.toIntOrNull() ?: continue
+                            val b = subs.getOrNull(rgbStart + 2)?.toIntOrNull() ?: continue
+                            expanded.add(head)
+                            expanded.add(2)
+                            expanded.add(r)
+                            expanded.add(g)
+                            expanded.add(b)
+                        }
+                    }
+                    // Other colon subparameters (e.g. 58:2:...) ignored without resetting active style
+                }
+            } else {
+                tok.toIntOrNull()?.let { expanded.add(it) }
+            }
+        }
+        applySgr(expanded)
+    }
+
     private fun applySgr(codes: List<Int>) {
         var i = 0
         while (i < codes.size) {
@@ -574,6 +784,18 @@ class AnsiEmulator(
                 val sep = value.indexOf(';')
                 val url = if (sep >= 0) value.substring(sep + 1) else value
                 currentOscLink = url.ifBlank { null }
+            }
+            "10" -> {
+                val parts = value.split(';')
+                if (parts.getOrNull(0)?.trim() == "?") {
+                    enqueueResponse("\u001B]10;rgb:e2e2/e8e8/f0f0\u001B\\")
+                }
+                if (parts.getOrNull(1)?.trim() == "?") {
+                    enqueueResponse("\u001B]11;rgb:0707/0b0b/1212\u001B\\")
+                }
+            }
+            "11" -> if (value.trim() == "?") {
+                enqueueResponse("\u001B]11;rgb:0707/0b0b/1212\u001B\\")
             }
         }
     }

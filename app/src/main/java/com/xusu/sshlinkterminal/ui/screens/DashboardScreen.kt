@@ -124,9 +124,7 @@ fun DashboardScreen(
     onToggleGlass: () -> Unit,
     onOpenWallpaperPicker: () -> Unit,
     onOpenGuardCard: () -> Unit,
-    onOpenSettings: () -> Unit,
     onOpenTerminalScreen: (String?) -> Unit,
-    onConnectHost: (HostProfile) -> Unit,
     onDisconnectHost: (String) -> Unit,
     onToggleGuardianAll: () -> Unit,
     onSaveHost: (HostProfile) -> Unit,
@@ -203,8 +201,7 @@ fun DashboardScreen(
                 onToggleMenu = onToggleMenu,
                 onToggleGlass = onToggleGlass,
                 onOpenTerminal = { onOpenTerminalScreen(null) },
-                onOpenGuardCard = onOpenGuardCard,
-                onOpenSettings = onOpenSettings
+                onOpenGuardCard = onOpenGuardCard
             )
 
             BoxWithConstraints(
@@ -412,18 +409,23 @@ fun DashboardScreen(
                     }
 
                     hosts.forEach { host ->
-                        val snap = sessions[host.id]
+                        val hostSessions = sessions.values.filter { it.hostId == host.id }
+                        val snap = hostSessions.firstOrNull {
+                            it.state == SessionState.CONNECTED || it.state == SessionState.AWAITING_OAUTH
+                        } ?: hostSessions.firstOrNull {
+                            it.state == SessionState.CONNECTING ||
+                                it.state == SessionState.RECONNECTING ||
+                                it.state == SessionState.AWAITING_INPUT
+                        } ?: hostSessions.firstOrNull()
                         HostProfileCard(
                             host = host,
                             snapshot = snap,
+                            sessionCount = hostSessions.size,
                             accentColor = accentColor,
                             hazeState = hazeState,
                             blurRadius = uiPreferences.blurRadius,
                             useGlass = uiPreferences.showWallpaper,
-                            onOpenTerminal = {
-                                onConnectHost(host)
-                                onOpenTerminalScreen(host.id)
-                            },
+                            onOpenTerminal = { onOpenTerminalScreen(host.id) },
                             onDisconnect = { onDisconnectHost(host.id) },
                             onEdit = { editingHost = host },
                             onDelete = { onDeleteHost(host.id) }
@@ -497,6 +499,7 @@ private fun FrostedGlassCard(
 private fun HostProfileCard(
     host: HostProfile,
     snapshot: SessionUiSnapshot?,
+    sessionCount: Int = 0,
     accentColor: Color,
     hazeState: HazeState,
     blurRadius: Float,
@@ -552,6 +555,21 @@ private fun HostProfileCard(
                         fontFamily = FontFamily.Monospace,
                         fontSize = 12.sp
                     )
+                }
+                if (sessionCount > 1) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = Color(0xFF1E293B).copy(alpha = 0.85f)
+                    ) {
+                        Text(
+                            text = "$sessionCount 会话",
+                            color = Color(0xFF93C5FD),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(6.dp))
                 }
                 Surface(
                     shape = RoundedCornerShape(10.dp),

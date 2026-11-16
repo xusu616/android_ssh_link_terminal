@@ -26,11 +26,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -41,9 +44,13 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 data class SessionUiSnapshot(
+    val sessionId: String = "",
     val hostId: String,
+    val sessionIndex: Int = 1,
     val hostName: String,
     val userAtHost: String,
     val state: SessionState = SessionState.IDLE,
@@ -62,13 +69,18 @@ class SshSessionController(
     private val context: Context,
     private val repository: AppRepository,
     private val onAutoOpenAuthUrl: (String) -> Unit,
-    initialHost: HostProfile
+    initialHost: HostProfile,
+    val sessionId: String = initialHost.id,
+    val sessionIndex: Int = 1
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @OptIn(ExperimentalCoroutinesApi::class)
     private val writeDispatcher = Dispatchers.IO.limitedParallelism(1)
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val uiSyncDispatcher = Dispatchers.IO.limitedParallelism(1)
     private val connectMutex = Mutex()
-    private val emulator = AnsiEmulator(initialCols = 80, initialRows = 28)
+    private val connectionGen = AtomicLong(0L)
+    private val emulator = AnsiEmulator(initialCols = 80, initialRows = 28, onTerminalResponse = ::sendText)
 
     @Volatile
     var hostProfile: HostProfile = initialHost
@@ -76,7 +88,9 @@ class SshSessionController(
 
     private val _snapshot = MutableStateFlow(
         SessionUiSnapshot(
+            sessionId = sessionId,
             hostId = initialHost.id,
+            sessionIndex = sessionIndex,
             hostName = initialHost.name,
             userAtHost = "${initialHost.username}@${initialHost.host}:${initialHost.port}"
         )
@@ -115,11 +129,23 @@ class SshSessionController(
 
     fun updateHostProfile(updated: HostProfile) {
         hostProfile = updated
-        _snapshot.value = _snapshot.value.copy(
-            hostName = updated.name,
-            userAtHost = "${updated.username}@${updated.host}:${updated.port}"
-        )
+        _snapshot.update {
+            it.copy(
+                hostName = updated.name,
+                userAtHost = "${updated.username}@${updated.host}:${updated.port}"
+            )
+        }
     }
+
+    private fun cancelPendingPrompt() {
+        val deferred = pendingPromptDeferred
+        pendingPromptDeferred = null
+        deferred?.cancel()
+        _snapshot.update { it.copy(pendingInteractivePrompt = null) }
+    }
+
+    private fun isAttemptActive(gen: Long, coroutineActive: Boolean): Boolean =
+        !userInitiatedStop && coroutineActive && connectionGen.get() == gen
 
     fun connect(forceRestart: Boolean = false) {
         val currentState = _snapshot.value.state
@@ -132,18 +158,20 @@ class SshSessionController(
             return
         }
         TerminalForegroundService.ensureStarted(context)
+        val gen = connectionGen.incrementAndGet()
         userInitiatedStop = false
+        cancelPendingPrompt()
         val previousConnection = connectionJob
         val previousKeepAlive = keepAliveJob
         previousKeepAlive?.cancel()
         previousConnection?.cancel()
+        // Unblock any blocking socket read immediately off Main thread before awaiting old loop teardown.
+        closeTransportAsync()
         val newJob = scope.launch {
-            // Unblock any blocking socket read before awaiting old loop teardown.
-            closeTransportOnly()
             connectMutex.withLock {
                 previousConnection?.cancelAndJoin()
-                if (!userInitiatedStop && isActive) {
-                    runConnectionLoop()
+                if (isAttemptActive(gen, currentCoroutineContext().isActive)) {
+                    runConnectionLoop(gen)
                 }
             }
         }
@@ -151,19 +179,33 @@ class SshSessionController(
     }
 
     fun disconnect() {
+        connectionGen.incrementAndGet()
         userInitiatedStop = true
-        pendingPromptDeferred?.cancel()
-        pendingPromptDeferred = null
+        cancelPendingPrompt()
         keepAliveJob?.cancel()
         connectionJob?.cancel()
-        closeTransportOnly()
-        appendSystemLine("\r\n\u001B[33m[已手动断开连接]\u001B[0m\r\n")
-        _snapshot.value = _snapshot.value.copy(
-            state = SessionState.DISCONNECTED,
-            statusDetail = "已断开",
-            connectedSinceMillis = null,
-            pendingInteractivePrompt = null
-        )
+        closeTransportAsync()
+        _snapshot.update {
+            it.copy(
+                state = SessionState.DISCONNECTED,
+                statusDetail = "已断开",
+                connectedSinceMillis = null,
+                pendingInteractivePrompt = null
+            )
+        }
+        scope.launch(uiSyncDispatcher) {
+            appendSystemLine("\r\n\u001B[33m[已手动断开连接]\u001B[0m\r\n")
+        }
+    }
+
+    fun destroy() {
+        connectionGen.incrementAndGet()
+        userInitiatedStop = true
+        cancelPendingPrompt()
+        keepAliveJob?.cancel()
+        connectionJob?.cancel()
+        closeTransportAsync()
+        scope.cancel()
     }
 
     fun onNetworkAvailable() {
@@ -199,8 +241,10 @@ class SshSessionController(
         if (safeCols == lastCols && safeRows == lastRows) return
         lastCols = safeCols
         lastRows = safeRows
-        emulator.resize(safeCols, safeRows)
-        refreshTerminalSnapshot()
+        scope.launch(uiSyncDispatcher) {
+            emulator.resize(safeCols, safeRows)
+            refreshTerminalSnapshot()
+        }
         scope.launch(writeDispatcher) {
             try {
                 shellChannel?.setPtySize(safeCols, safeRows, 0, 0)
@@ -210,18 +254,20 @@ class SshSessionController(
     }
 
     fun clearTerminal() {
-        emulator.clear()
-        refreshTerminalSnapshot()
+        scope.launch(uiSyncDispatcher) {
+            emulator.clear()
+            refreshTerminalSnapshot()
+        }
     }
 
     fun dismissAuthLink() {
-        _snapshot.value = _snapshot.value.copy(detectedAuthLink = null)
+        _snapshot.update { it.copy(detectedAuthLink = null) }
     }
 
     fun submitInteractivePrompt(answers: List<String>?) {
         val deferred = pendingPromptDeferred
         pendingPromptDeferred = null
-        _snapshot.value = _snapshot.value.copy(pendingInteractivePrompt = null)
+        _snapshot.update { it.copy(pendingInteractivePrompt = null) }
         deferred?.complete(answers)
     }
 
@@ -235,41 +281,46 @@ class SshSessionController(
         }
     }
 
-    private suspend fun runConnectionLoop() {
+    private suspend fun runConnectionLoop(gen: Long) {
         var attempt = 0
-        while (!userInitiatedStop && scope.isActive) {
+        while (isAttemptActive(gen, currentCoroutineContext().isActive)) {
             val currentHost = hostProfile
-            _snapshot.value = _snapshot.value.copy(
-                state = if (attempt == 0) SessionState.CONNECTING else SessionState.RECONNECTING,
-                statusDetail = if (attempt == 0) "正在连接 ${currentHost.host}:${currentHost.port}..." else "第 $attempt 次重连中...",
-                reconnectAttempts = attempt
-            )
+            _snapshot.update {
+                it.copy(
+                    state = if (attempt == 0) SessionState.CONNECTING else SessionState.RECONNECTING,
+                    statusDetail = if (attempt == 0) "正在连接 ${currentHost.host}:${currentHost.port}..." else "第 $attempt 次重连中...",
+                    reconnectAttempts = attempt
+                )
+            }
             appendSystemLine("\r\n\u001B[36m[LinkTerm] 连接 ${currentHost.username}@${currentHost.host}:${currentHost.port}...\u001B[0m\r\n")
 
             var unexpectedFailureMessage: String? = null
             try {
-                establishAndStreamSession(currentHost)
-                if (!userInitiatedStop) {
+                establishAndStreamSession(currentHost, gen)
+                if (isAttemptActive(gen, currentCoroutineContext().isActive)) {
                     unexpectedFailureMessage = "远端会话已关闭"
                 }
             } catch (e: Exception) {
-                if (!userInitiatedStop) {
+                if (isAttemptActive(gen, currentCoroutineContext().isActive)) {
                     unexpectedFailureMessage = e.message ?: e::class.java.simpleName
                     repository.appendLog("WARN", "SSH", "${currentHost.name}: 连接中断 - $unexpectedFailureMessage")
                     appendSystemLine("\r\n\u001B[31m[连接异常: $unexpectedFailureMessage]\u001B[0m\r\n")
                 }
             } finally {
-                keepAliveJob?.cancel()
-                closeTransportOnly()
+                if (connectionGen.get() == gen) {
+                    keepAliveJob?.cancel()
+                }
             }
 
-            if (userInitiatedStop || !currentHost.autoReconnect) {
-                if (!userInitiatedStop) {
-                    _snapshot.value = _snapshot.value.copy(
-                        state = SessionState.ERROR,
-                        statusDetail = unexpectedFailureMessage ?: "连接已断开",
-                        connectedSinceMillis = null
-                    )
+            if (!isAttemptActive(gen, currentCoroutineContext().isActive) || !currentHost.autoReconnect) {
+                if (!userInitiatedStop && connectionGen.get() == gen && currentCoroutineContext().isActive) {
+                    _snapshot.update {
+                        it.copy(
+                            state = SessionState.ERROR,
+                            statusDetail = unexpectedFailureMessage ?: "连接已断开",
+                            connectedSinceMillis = null
+                        )
+                    }
                 }
                 break
             }
@@ -282,124 +333,153 @@ class SshSessionController(
                 4 -> 15_000L
                 else -> 30_000L
             }
-            _snapshot.value = _snapshot.value.copy(
-                state = SessionState.RECONNECTING,
-                statusDetail = "等待 ${backoffMs / 1000}s 后自动重连 ($unexpectedFailureMessage)",
-                connectedSinceMillis = null,
-                reconnectAttempts = attempt
-            )
+            if (isAttemptActive(gen, currentCoroutineContext().isActive)) {
+                _snapshot.update {
+                    it.copy(
+                        state = SessionState.RECONNECTING,
+                        statusDetail = "等待 ${backoffMs / 1000}s 后自动重连 ($unexpectedFailureMessage)",
+                        connectedSinceMillis = null,
+                        reconnectAttempts = attempt
+                    )
+                }
+            }
             delay(backoffMs)
         }
     }
 
-    private suspend fun establishAndStreamSession(host: HostProfile) = withContext(Dispatchers.IO) {
+    private suspend fun establishAndStreamSession(host: HostProfile, gen: Long) = withContext(Dispatchers.IO) {
+        emulator.resetParserState()
         val jsch = JSch()
         configureIdentities(jsch, host)
 
         val session = jsch.getSession(host.username, host.host, host.port)
-        jschSession = session
-        session.setConfig("StrictHostKeyChecking", "no")
-        session.setConfig(
-            "PreferredAuthentications",
-            when (host.authType) {
-                AuthType.PUBLIC_KEY -> "publickey,keyboard-interactive,password"
-                AuthType.INTERACTIVE_OR_TAILSCALE -> "keyboard-interactive,publickey,password"
-                AuthType.PASSWORD -> "password,keyboard-interactive,publickey"
+        var channel: ChannelShell? = null
+        var outStream: OutputStream? = null
+        try {
+            jschSession = session
+            session.setConfig("StrictHostKeyChecking", "no")
+            session.setConfig(
+                "PreferredAuthentications",
+                when (host.authType) {
+                    AuthType.PUBLIC_KEY -> "publickey,keyboard-interactive,password"
+                    AuthType.INTERACTIVE_OR_TAILSCALE -> "keyboard-interactive,publickey,password"
+                    AuthType.PASSWORD -> "password,keyboard-interactive,publickey"
+                }
+            )
+            session.setConfig("Compression", "none")
+            session.setConfig("TCPKeepAlive", "yes")
+
+            val savedPassword = VaultCrypto.decrypt(host.encryptedPassword)
+            if (savedPassword.isNotEmpty() && host.authType != AuthType.PUBLIC_KEY) {
+                session.setPassword(savedPassword.toByteArray(StandardCharsets.UTF_8))
             }
-        )
-        session.setConfig("Compression", "none")
-        session.setConfig("TCPKeepAlive", "yes")
+            val aliveSec = host.keepAliveIntervalSec.coerceIn(15, 300)
+            // Use a tolerant ServerAlive budget (~15 min) without overriding SO_TIMEOUT below ServerAliveInterval,
+            // so brief screen-off / OEM freezer pauses do not tear down an otherwise healthy TCP session.
+            val serverAliveMs = maxOf(aliveSec, 45) * 1000
+            session.setServerAliveInterval(serverAliveMs)
+            session.setServerAliveCountMax(20)
 
-        val savedPassword = VaultCrypto.decrypt(host.encryptedPassword)
-        if (savedPassword.isNotEmpty() && host.authType != AuthType.PUBLIC_KEY) {
-            session.setPassword(savedPassword.toByteArray(StandardCharsets.UTF_8))
-        }
-        val aliveSec = host.keepAliveIntervalSec.coerceIn(15, 300)
-        // Use a tolerant ServerAlive budget (~15 min) without overriding SO_TIMEOUT below ServerAliveInterval,
-        // so brief screen-off / OEM freezer pauses do not tear down an otherwise healthy TCP session.
-        val serverAliveMs = maxOf(aliveSec, 45) * 1000
-        session.setServerAliveInterval(serverAliveMs)
-        session.setServerAliveCountMax(20)
+            session.userInfo = createSshUserInfo(host, savedPassword)
 
-        session.userInfo = createSshUserInfo(host, savedPassword)
+            // Tailscale Check Mode / interactive SSO may take up to ~2 minutes while user authorizes in browser
+            session.connect(90_000)
+            if (!isAttemptActive(gen, currentCoroutineContext().isActive)) return@withContext
 
-        // Tailscale Check Mode / interactive SSO may take up to ~2 minutes while user authorizes in browser
-        session.connect(90_000)
+            channel = session.openChannel("shell") as ChannelShell
+            shellChannel = channel
+            channel.setPty(true)
+            channel.setPtyType("xterm-256color")
+            channel.setPtySize(lastCols, lastRows, 0, 0)
 
-        val channel = session.openChannel("shell") as ChannelShell
-        shellChannel = channel
-        channel.setPty(true)
-        channel.setPtyType("xterm-256color")
-        channel.setPtySize(lastCols, lastRows, 0, 0)
+            val inStream = channel.inputStream
+            outStream = channel.outputStream
+            shellOut = outStream
+            channel.connect(15_000)
+            if (!isAttemptActive(gen, currentCoroutineContext().isActive)) return@withContext
 
-        val inStream = channel.inputStream
-        shellOut = channel.outputStream
-        channel.connect(15_000)
+            val connectedAt = System.currentTimeMillis()
+            _snapshot.update {
+                it.copy(
+                    state = SessionState.CONNECTED,
+                    statusDetail = "在线 · 心跳 ${aliveSec}s",
+                    connectedSinceMillis = connectedAt,
+                    reconnectAttempts = 0,
+                    pendingInteractivePrompt = null
+                )
+            }
+            val label = if (sessionIndex <= 1) host.name else "${host.name} #$sessionIndex"
+            repository.appendLog("INFO", "SSH", "$label: SSH 会话已建立")
 
-        val connectedAt = System.currentTimeMillis()
-        _snapshot.value = _snapshot.value.copy(
-            state = SessionState.CONNECTED,
-            statusDetail = "在线 · 心跳 ${aliveSec}s",
-            connectedSinceMillis = connectedAt,
-            reconnectAttempts = 0,
-            pendingInteractivePrompt = null
-        )
-        repository.appendLog("INFO", "SSH", "${host.name}: SSH 会话已建立")
-
-        // Start heartbeat RTT probe at a gentle cadence to populate chart telemetry without flooding idle sockets.
-        keepAliveJob?.cancel()
-        val probeIntervalMs = maxOf(aliveSec, 30) * 1000L
-        keepAliveJob = scope.launch {
-            while (isActive && session.isConnected && channel.isConnected) {
-                delay(probeIntervalMs)
-                if (!session.isConnected || !channel.isConnected) break
-                val start = SystemClock.elapsedRealtime()
-                try {
-                    session.sendKeepAliveMsg()
-                    val rtt = (SystemClock.elapsedRealtime() - start).coerceAtLeast(1L)
-                    _snapshot.value = _snapshot.value.copy(
-                        lastRttMs = rtt,
-                        statusDetail = "在线 · ${rtt}ms"
-                    )
-                    repository.appendRttSample(rttMs = rtt, activeSessions = 1)
-                } catch (e: Exception) {
-                    repository.appendLog("WARN", "KeepAlive", "${host.name}: 心跳异常 ${e.message}")
-                    if (!session.isConnected) break
+            // Start heartbeat RTT probe at a gentle cadence to populate chart telemetry without flooding idle sockets.
+            keepAliveJob?.cancel()
+            val probeIntervalMs = maxOf(aliveSec, 30) * 1000L
+            keepAliveJob = scope.launch {
+                while (isActive && session.isConnected && channel.isConnected && connectionGen.get() == gen) {
+                    delay(probeIntervalMs)
+                    if (!session.isConnected || !channel.isConnected || connectionGen.get() != gen) break
+                    val start = SystemClock.elapsedRealtime()
+                    try {
+                        session.sendKeepAliveMsg()
+                        val rtt = (SystemClock.elapsedRealtime() - start).coerceAtLeast(1L)
+                        _snapshot.update {
+                            it.copy(
+                                lastRttMs = rtt,
+                                statusDetail = "在线 · ${rtt}ms"
+                            )
+                        }
+                        repository.appendRttSample(rttMs = rtt, activeSessions = 1)
+                    } catch (e: Exception) {
+                        repository.appendLog("WARN", "KeepAlive", "$label: 心跳异常 ${e.message}")
+                        if (!session.isConnected) break
+                    }
                 }
             }
-        }
 
-        // Execute optional auto-attach command (e.g., tmux attach)
-        if (host.autoAttachCommand.isNotBlank()) {
-            scope.launch {
-                delay(280)
-                if (channel.isConnected) {
-                    sendText(host.autoAttachCommand.trim() + "\n")
+            // Execute optional auto-attach command (e.g., tmux attach)
+            if (host.autoAttachCommand.isNotBlank()) {
+                scope.launch {
+                    delay(280)
+                    if (channel.isConnected && connectionGen.get() == gen) {
+                        sendText(host.autoAttachCommand.trim() + "\n")
+                    }
                 }
             }
-        }
 
-        val buffer = ByteArray(8192)
-        var lastSnapshotAt = 0L
-        var dirtySnapshot = false
-        while (scope.isActive && !userInitiatedStop) {
-            val read = inStream.read(buffer)
-            if (read < 0) break
-            if (read > 0) {
-                val decoded = emulator.feedBytes(buffer, read)
-                scanTextForAuthUrls(decoded)
-                val now = SystemClock.elapsedRealtime()
-                if (inStream.available() == 0 || now - lastSnapshotAt >= 40L) {
-                    refreshTerminalSnapshot()
-                    lastSnapshotAt = now
-                    dirtySnapshot = false
-                } else {
-                    dirtySnapshot = true
+            val buffer = ByteArray(8192)
+            var lastSnapshotAt = 0L
+            var dirtySnapshot = false
+            while (isAttemptActive(gen, currentCoroutineContext().isActive)) {
+                val read = inStream.read(buffer)
+                if (read < 0) break
+                if (read > 0 && isAttemptActive(gen, currentCoroutineContext().isActive)) {
+                    val decoded = emulator.feedBytes(buffer, read)
+                    scanTextForAuthUrls(decoded)
+                    val now = SystemClock.elapsedRealtime()
+                    if (inStream.available() == 0 || now - lastSnapshotAt >= 40L) {
+                        refreshTerminalSnapshot()
+                        lastSnapshotAt = now
+                        dirtySnapshot = false
+                    } else {
+                        dirtySnapshot = true
+                    }
                 }
             }
-        }
-        if (dirtySnapshot) {
-            refreshTerminalSnapshot()
+            if (dirtySnapshot && isAttemptActive(gen, currentCoroutineContext().isActive)) {
+                refreshTerminalSnapshot()
+            }
+        } finally {
+            try {
+                channel?.disconnect()
+            } catch (_: Throwable) {
+            }
+            try {
+                session.disconnect()
+            } catch (_: Throwable) {
+            }
+            if (shellOut === outStream) shellOut = null
+            if (shellChannel === channel) shellChannel = null
+            if (jschSession === session) jschSession = null
         }
     }
 
@@ -515,16 +595,18 @@ class SshSessionController(
     ): List<String>? {
         val deferred = CompletableDeferred<List<String>?>()
         pendingPromptDeferred = deferred
-        _snapshot.value = _snapshot.value.copy(
-            state = SessionState.AWAITING_INPUT,
-            statusDetail = "等待输入认证信息",
-            pendingInteractivePrompt = InteractivePromptRequest(
-                title = title,
-                instruction = instruction,
-                prompts = prompts,
-                echo = echo
+        _snapshot.update {
+            it.copy(
+                state = SessionState.AWAITING_INPUT,
+                statusDetail = "等待输入认证信息",
+                pendingInteractivePrompt = InteractivePromptRequest(
+                    title = title,
+                    instruction = instruction,
+                    prompts = prompts,
+                    echo = echo
+                )
             )
-        )
+        }
         return runBlocking {
             withTimeoutOrNull(120_000L) {
                 deferred.await()
@@ -542,11 +624,13 @@ class SshSessionController(
             val detected = LinkDetector.detectAuthLink(authRollingBuffer.toString())
             if (detected != null) {
                 val previousUrl = _snapshot.value.detectedAuthLink?.url
-                _snapshot.value = _snapshot.value.copy(
-                    detectedAuthLink = detected,
-                    state = if (isAuthHandshake) SessionState.AWAITING_OAUTH else _snapshot.value.state,
-                    statusDetail = if (isAuthHandshake) "等待浏览器完成 ${detected.providerLabel}" else _snapshot.value.statusDetail
-                )
+                _snapshot.update {
+                    it.copy(
+                        detectedAuthLink = detected,
+                        state = if (isAuthHandshake) SessionState.AWAITING_OAUTH else it.state,
+                        statusDetail = if (isAuthHandshake) "等待浏览器完成 ${detected.providerLabel}" else it.statusDetail
+                    )
+                }
                 if (detected.url != previousUrl && detected.url != lastAutoOpenedUrl) {
                     repository.appendLog("INFO", "OAuth", "捕获 ${detected.providerLabel}: ${detected.url}")
                     if (repository.uiPreferences.value.autoOpenOAuthUrl) {
@@ -565,24 +649,32 @@ class SshSessionController(
 
     private fun refreshTerminalSnapshot() {
         val lines = emulator.snapshotLines()
-        _snapshot.value = _snapshot.value.copy(
-            terminalLines = lines,
-            terminalRevision = _snapshot.value.terminalRevision + 1L,
-            windowTitle = emulator.windowTitle
-        )
+        val title = emulator.windowTitle
+        _snapshot.update {
+            it.copy(
+                terminalLines = lines,
+                terminalRevision = it.terminalRevision + 1L,
+                windowTitle = title
+            )
+        }
     }
 
-    private fun closeTransportOnly() {
-        try {
-            shellOut = null
-            shellChannel?.disconnect()
-            shellChannel = null
-        } catch (_: Throwable) {
-        }
-        try {
-            jschSession?.disconnect()
-            jschSession = null
-        } catch (_: Throwable) {
+    private fun closeTransportAsync() {
+        val oldChannel = shellChannel
+        val oldSession = jschSession
+        shellOut = null
+        shellChannel = null
+        jschSession = null
+        if (oldChannel == null && oldSession == null) return
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                oldChannel?.disconnect()
+            } catch (_: Throwable) {
+            }
+            try {
+                oldSession?.disconnect()
+            } catch (_: Throwable) {
+            }
         }
     }
 }
@@ -592,10 +684,16 @@ class SshSessionManager(
     private val repository: AppRepository
 ) {
     private val appContext = context.applicationContext
+    private val managerLock = Any()
     private val controllers = ConcurrentHashMap<String, SshSessionController>()
+    private val collectorJobs = ConcurrentHashMap<String, Job>()
+    private val sessionSeq = AtomicInteger(0)
 
     private val _snapshots = MutableStateFlow<Map<String, SessionUiSnapshot>>(emptyMap())
     val snapshots: StateFlow<Map<String, SessionUiSnapshot>> = _snapshots.asStateFlow()
+
+    private val _activeSessionId = MutableStateFlow<String?>(null)
+    val activeSessionId: StateFlow<String?> = _activeSessionId.asStateFlow()
 
     private val _activeHostId = MutableStateFlow<String?>(null)
     val activeHostId: StateFlow<String?> = _activeHostId.asStateFlow()
@@ -609,46 +707,153 @@ class SshSessionManager(
         }
     }
 
-    fun getOrCreateController(host: HostProfile): SshSessionController {
-        val existing = controllers[host.id]
-        if (existing != null) {
-            existing.updateHostProfile(host)
-            return existing
-        }
+    private fun sessionPriorityRank(state: SessionState): Int = when (state) {
+        SessionState.CONNECTED -> 0
+        SessionState.AWAITING_OAUTH, SessionState.AWAITING_INPUT -> 1
+        SessionState.CONNECTING, SessionState.RECONNECTING -> 2
+        SessionState.DISCONNECTED -> 3
+        SessionState.ERROR -> 4
+        SessionState.IDLE -> 5
+    }
+
+    private fun findPrimaryControllerForHostLocked(hostId: String): SshSessionController? {
+        val active = _activeSessionId.value?.let { controllers[it] }
+        if (active != null && active.hostProfile.id == hostId) return active
+        return controllers.values
+            .filter { it.hostProfile.id == hostId }
+            .minWithOrNull(
+                compareBy<SshSessionController> { sessionPriorityRank(it.snapshot.value.state) }
+                    .thenBy { it.sessionIndex }
+            )
+    }
+
+    private fun registerControllerLocked(
+        sessionId: String,
+        sessionIndex: Int,
+        host: HostProfile
+    ): SshSessionController {
+        controllers[sessionId]?.let { return it }
         val created = SshSessionController(
             context = appContext,
             repository = repository,
             onAutoOpenAuthUrl = autoOpenCallback,
-            initialHost = host
+            initialHost = host,
+            sessionId = sessionId,
+            sessionIndex = sessionIndex
         )
-        controllers[host.id] = created
-        scope.launch {
+        controllers[sessionId] = created
+        _snapshots.update { it + (sessionId to created.snapshot.value) }
+        collectorJobs[sessionId] = scope.launch {
             created.snapshot.collect { snap ->
-                _snapshots.value = _snapshots.value.toMutableMap().apply { put(host.id, snap) }
+                if (controllers[sessionId] === created) {
+                    _snapshots.update { it + (sessionId to snap) }
+                }
             }
         }
         return created
     }
 
+    fun getControllerBySessionId(sessionId: String): SshSessionController? = controllers[sessionId]
+
+    fun updateHostProfiles(updated: HostProfile) {
+        synchronized(managerLock) {
+            controllers.values
+                .filter { it.hostProfile.id == updated.id }
+                .forEach { it.updateHostProfile(updated) }
+        }
+    }
+
+    fun getOrCreateController(host: HostProfile): SshSessionController = synchronized(managerLock) {
+        controllers.values
+            .filter { it.hostProfile.id == host.id }
+            .forEach { it.updateHostProfile(host) }
+        findPrimaryControllerForHostLocked(host.id)?.let { return@synchronized it }
+        registerControllerLocked(sessionId = host.id, sessionIndex = 1, host = host)
+    }
+
+    fun createNewSession(host: HostProfile): SshSessionController {
+        val created = synchronized(managerLock) {
+            val existingForHost = controllers.values.filter { it.hostProfile.id == host.id }
+            val nextIndex = (existingForHost.maxOfOrNull { it.sessionIndex } ?: 0) + 1
+            val newSessionId = if (controllers[host.id] == null && nextIndex == 1) {
+                host.id
+            } else {
+                "${host.id}#${sessionSeq.incrementAndGet()}"
+            }
+            registerControllerLocked(
+                sessionId = newSessionId,
+                sessionIndex = nextIndex,
+                host = host
+            ).also {
+                _activeHostId.value = host.id
+                _activeSessionId.value = it.sessionId
+            }
+        }
+        created.connect()
+        return created
+    }
+
     fun openAndConnect(host: HostProfile) {
-        _activeHostId.value = host.id
-        getOrCreateController(host).connect()
+        val controller = synchronized(managerLock) {
+            getOrCreateController(host).also {
+                _activeHostId.value = host.id
+                _activeSessionId.value = it.sessionId
+            }
+        }
+        controller.connect()
     }
 
     fun selectHost(hostId: String) {
-        _activeHostId.value = hostId
+        synchronized(managerLock) {
+            _activeHostId.value = hostId
+            _activeSessionId.value = findPrimaryControllerForHostLocked(hostId)?.sessionId
+        }
+    }
+
+    fun selectSession(sessionId: String) {
+        synchronized(managerLock) {
+            val controller = controllers[sessionId] ?: return
+            _activeSessionId.value = sessionId
+            _activeHostId.value = controller.hostProfile.id
+        }
+    }
+
+    fun closeSession(sessionId: String) {
+        val removed = synchronized(managerLock) {
+            val ctrl = controllers.remove(sessionId) ?: return
+            val hostId = ctrl.hostProfile.id
+            collectorJobs.remove(sessionId)?.cancel()
+            _snapshots.update { it - sessionId }
+            if (_activeSessionId.value == sessionId) {
+                val sameHostFallback = controllers.values
+                    .filter { it.hostProfile.id == hostId }
+                    .minByOrNull { it.sessionIndex }
+                val fallback = sameHostFallback ?: controllers.values.firstOrNull()
+                _activeSessionId.value = fallback?.sessionId
+                if (fallback != null) {
+                    _activeHostId.value = fallback.hostProfile.id
+                }
+            }
+            ctrl
+        }
+        removed.destroy()
     }
 
     fun disconnectHost(hostId: String) {
-        controllers[hostId]?.disconnect()
+        val list = synchronized(managerLock) {
+            controllers.values.filter { it.hostProfile.id == hostId }
+        }
+        list.forEach { it.disconnect() }
     }
 
     fun disconnectAll() {
-        controllers.values.forEach { it.disconnect() }
+        val list = synchronized(managerLock) { controllers.values.toList() }
+        list.forEach { it.disconnect() }
     }
 
     fun reconnectAll() {
-        controllers.values.forEach { controller ->
+        val list = synchronized(managerLock) { controllers.values.toList() }
+        list.forEach { controller ->
             if (controller.hostProfile.pinInDaemon || controller.snapshot.value.state != SessionState.IDLE) {
                 controller.connect(forceRestart = true)
             }
@@ -670,15 +875,29 @@ class SshSessionManager(
     }
 
     fun onNetworkAvailable() {
-        controllers.values.forEach { it.onNetworkAvailable() }
+        val list = synchronized(managerLock) { controllers.values.toList() }
+        list.forEach { it.onNetworkAvailable() }
     }
 
     fun removeHostController(hostId: String) {
-        controllers.remove(hostId)?.disconnect()
-        _snapshots.value = _snapshots.value.toMutableMap().apply { remove(hostId) }
-        if (_activeHostId.value == hostId) {
-            _activeHostId.value = _snapshots.value.keys.firstOrNull()
+        val removedList = synchronized(managerLock) {
+            val targets = controllers.values.filter { it.hostProfile.id == hostId }
+            val removedIds = targets.map { it.sessionId }
+            targets.forEach { ctrl ->
+                controllers.remove(ctrl.sessionId)
+                collectorJobs.remove(ctrl.sessionId)?.cancel()
+            }
+            if (removedIds.isNotEmpty()) {
+                _snapshots.update { it - removedIds.toSet() }
+            }
+            if (_activeHostId.value == hostId || (_activeSessionId.value in removedIds)) {
+                val fallback = controllers.values.firstOrNull()
+                _activeSessionId.value = fallback?.sessionId
+                _activeHostId.value = fallback?.hostProfile?.id
+            }
+            targets
         }
+        removedList.forEach { it.destroy() }
     }
 
     fun activeConnectedCount(): Int =

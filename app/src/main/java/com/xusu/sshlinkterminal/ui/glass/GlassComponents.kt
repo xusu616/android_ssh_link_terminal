@@ -52,7 +52,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.BlurOn
 import androidx.compose.material.icons.rounded.Menu
-import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.WarningAmber
@@ -591,7 +590,6 @@ fun NarrowGlassRail(
     onToggleGlass: () -> Unit,
     onOpenTerminal: () -> Unit,
     onOpenGuardCard: () -> Unit,
-    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val btnBg = if (colorBag.useM3Color) MaterialTheme.colorScheme.secondaryContainer else colorBag.vibrant
@@ -648,14 +646,6 @@ fun NarrowGlassRail(
                     contentDescription = "切换玻璃背景",
                     modifier = Modifier.rotate(rotation)
                 )
-            }
-
-            FilledTonalIconButton(
-                onClick = onOpenSettings,
-                modifier = Modifier.size(48.dp),
-                colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = btnBg, contentColor = btnFg)
-            ) {
-                Icon(Icons.Rounded.Settings, contentDescription = "外观设置")
             }
 
             OutlinedIconButton(

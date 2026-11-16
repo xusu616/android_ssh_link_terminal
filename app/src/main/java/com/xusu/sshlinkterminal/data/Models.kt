@@ -74,6 +74,8 @@ data class UiPreferences(
     val terminalFontPreset: String = "AUTO",
     val terminalCustomFontPath: String? = null,
     val terminalCustomFontName: String? = null,
+    val terminalNerdIconsEnabled: Boolean = true,
+    val terminalNerdIconsPath: String? = null,
     val terminalHorizontalScroll: Boolean = true,
     val accentDepth: Float = 0.28f,
     val autoOpenOAuthUrl: Boolean = true,

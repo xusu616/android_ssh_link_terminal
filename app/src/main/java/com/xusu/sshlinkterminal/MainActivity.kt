@@ -26,7 +26,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Key
-import androidx.compose.material.icons.rounded.Palette
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.Tune
@@ -57,6 +57,7 @@ import com.xusu.sshlinkterminal.data.ColorBag
 import com.xusu.sshlinkterminal.data.MacroButton
 import com.xusu.sshlinkterminal.data.SessionState
 import com.xusu.sshlinkterminal.service.TerminalForegroundService
+import com.xusu.sshlinkterminal.terminal.NerdFontPacks
 import com.xusu.sshlinkterminal.ui.components.GuardStatusOverlay
 import com.xusu.sshlinkterminal.ui.glass.NarrowRailWidth
 import com.xusu.sshlinkterminal.ui.glass.ResponsiveSideMenuLayout
@@ -104,6 +105,7 @@ class MainActivity : ComponentActivity() {
             val macros by app.repository.macros.collectAsState()
             val sessions by app.sshManager.snapshots.collectAsState()
             val activeHostId by app.sshManager.activeHostId.collectAsState()
+            val activeSessionId by app.sshManager.activeSessionId.collectAsState()
             val rttSamples by app.repository.rttSamples.collectAsState()
             val guardStatus by app.shizukuManager.guardStatus.collectAsState()
             val logs by app.repository.logs.collectAsState()
@@ -297,7 +299,7 @@ class MainActivity : ComponentActivity() {
                                     SideMenuItem(Routes.TERMINAL, "假终端工作台", "外置快捷键与 OAuth 桥接", Icons.Rounded.Terminal),
                                     SideMenuItem(Routes.KEYS, "SSH 密钥库", "生成 Ed25519 与公钥部署", Icons.Rounded.Key),
                                     SideMenuItem(Routes.MACROS, "外置按钮定制", "管理命令行与彩色宏胶囊", Icons.Rounded.Tune),
-                                    SideMenuItem(Routes.SETTINGS, "外观与壁纸实验室", "Haze 模糊、取色与启动策略", Icons.Rounded.Palette),
+                                    SideMenuItem(Routes.SETTINGS, "设置", "界面外观、终端字体与守护策略", Icons.Rounded.Settings),
                                     SideMenuItem(Routes.LOGS, "守护日志与更新", "诊断记录与 GitLab 版本检查", Icons.Rounded.Description)
                                 )
                             }
@@ -349,17 +351,18 @@ class MainActivity : ComponentActivity() {
                                             scope.launch { app.shizukuManager.refreshStatus() }
                                             showGuardCard = true
                                         },
-                                        onOpenSettings = { navController.navigate(Routes.SETTINGS) },
                                         onOpenTerminalScreen = { hostId ->
                                             val target = hostId?.let { id -> hosts.firstOrNull { it.id == id } } ?: hosts.firstOrNull()
-                                            if (target != null && sessions[target.id] == null) {
-                                                app.sshManager.openAndConnect(target)
-                                            } else if (target != null) {
-                                                app.sshManager.selectHost(target.id)
+                                            if (target != null) {
+                                                val hostSnaps = sessions.values.filter { it.hostId == target.id }
+                                                if (hostSnaps.isEmpty() || hostSnaps.all { it.state == SessionState.IDLE }) {
+                                                    app.sshManager.openAndConnect(target)
+                                                } else {
+                                                    app.sshManager.selectHost(target.id)
+                                                }
                                             }
                                             navController.navigate(Routes.TERMINAL)
                                         },
-                                        onConnectHost = { host -> app.sshManager.openAndConnect(host) },
                                         onDisconnectHost = { hostId -> app.sshManager.disconnectHost(hostId) },
                                         onToggleGuardianAll = {
                                             val hasRunning = guardStatus.foregroundServiceRunning || sessions.values.any {
@@ -386,7 +389,7 @@ class MainActivity : ComponentActivity() {
                                         },
                                         onSaveHost = { host ->
                                             app.repository.upsertHost(host)
-                                            app.sshManager.getOrCreateController(host)
+                                            app.sshManager.updateHostProfiles(host)
                                         },
                                         onDeleteHost = { hostId ->
                                             app.sshManager.removeHostController(hostId)
@@ -462,48 +465,53 @@ class MainActivity : ComponentActivity() {
                                 hosts = hosts,
                                 keys = keys,
                                 activeHostId = activeHostId,
+                                activeSessionId = activeSessionId,
                                 sessions = sessions,
                                 macros = macros,
                                 onBack = { navController.popBackStack() },
                                 onSelectHost = { host ->
-                                    app.sshManager.selectHost(host.id)
-                                    if (sessions[host.id] == null) {
+                                    val hostSnaps = sessions.values.filter { it.hostId == host.id }
+                                    if (hostSnaps.isEmpty() || hostSnaps.all { it.state == SessionState.IDLE }) {
+                                        app.sshManager.openAndConnect(host)
+                                    } else {
+                                        app.sshManager.selectHost(host.id)
+                                    }
+                                },
+                                onSelectSession = { sessionId ->
+                                    app.sshManager.selectSession(sessionId)
+                                },
+                                onNewSession = { host ->
+                                    app.sshManager.createNewSession(host)
+                                },
+                                onCloseSession = { sessionId ->
+                                    app.sshManager.closeSession(sessionId)
+                                },
+                                onReconnectSession = { sessionKey, host ->
+                                    val ctrl = app.sshManager.getControllerBySessionId(sessionKey)
+                                    if (ctrl != null) {
+                                        ctrl.connect(forceRestart = true)
+                                    } else {
                                         app.sshManager.openAndConnect(host)
                                     }
                                 },
-                                onReconnectHost = { host ->
-                                    app.sshManager.getOrCreateController(host).connect(forceRestart = true)
+                                onSendText = { sessionKey, text ->
+                                    app.sshManager.getControllerBySessionId(sessionKey)?.sendText(text)
                                 },
-                                onSendText = { hostId, text ->
-                                    hosts.firstOrNull { it.id == hostId }?.let { host ->
-                                        app.sshManager.getOrCreateController(host).sendText(text)
-                                    }
+                                onResizePty = { sessionKey, cols, rows ->
+                                    app.sshManager.getControllerBySessionId(sessionKey)?.resizePty(cols, rows)
                                 },
-                                onResizePty = { hostId, cols, rows ->
-                                    hosts.firstOrNull { it.id == hostId }?.let { host ->
-                                        app.sshManager.getOrCreateController(host).resizePty(cols, rows)
-                                    }
+                                onClearTerminal = { sessionKey ->
+                                    app.sshManager.getControllerBySessionId(sessionKey)?.clearTerminal()
                                 },
-                                onClearTerminal = { hostId ->
-                                    hosts.firstOrNull { it.id == hostId }?.let { host ->
-                                        app.sshManager.getOrCreateController(host).clearTerminal()
-                                    }
+                                onDismissAuthLink = { sessionKey ->
+                                    app.sshManager.getControllerBySessionId(sessionKey)?.dismissAuthLink()
                                 },
-                                onDismissAuthLink = { hostId ->
-                                    hosts.firstOrNull { it.id == hostId }?.let { host ->
-                                        app.sshManager.getOrCreateController(host).dismissAuthLink()
-                                    }
+                                onSubmitInteractivePrompt = { sessionKey, answers ->
+                                    app.sshManager.getControllerBySessionId(sessionKey)?.submitInteractivePrompt(answers)
                                 },
-                                onSubmitInteractivePrompt = { hostId, answers ->
-                                    hosts.firstOrNull { it.id == hostId }?.let { host ->
-                                        app.sshManager.getOrCreateController(host).submitInteractivePrompt(answers)
-                                    }
-                                },
-                                onDeployPublicKey = { hostId, pubKey ->
-                                    hosts.firstOrNull { it.id == hostId }?.let { host ->
-                                        app.sshManager.getOrCreateController(host).deployKey(pubKey) { _, msg ->
-                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                                        }
+                                onDeployPublicKey = { sessionKey, pubKey ->
+                                    app.sshManager.getControllerBySessionId(sessionKey)?.deployKey(pubKey) { _, msg ->
+                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                                     }
                                 },
                                 onFontScaleChange = { newSp ->
@@ -639,21 +647,7 @@ private fun importTerminalFontFile(context: Context, uri: Uri): Pair<String, Str
         return null
     }
 
-    // Validate TTF / OTF / TTC SFNT header magic bytes before accepting the file.
-    val validHeader = runCatching {
-        val header = ByteArray(4)
-        dest.inputStream().use { it.read(header) }
-        val tag = String(header, Charsets.US_ASCII)
-        val isSfntTrueType = header[0] == 0.toByte() && header[1] == 1.toByte() && header[2] == 0.toByte() && header[3] == 0.toByte()
-        isSfntTrueType || tag == "OTTO" || tag == "ttcf" || tag == "true" || tag == "typ1"
-    }.getOrDefault(false)
-    if (!validHeader) {
-        dest.delete()
-        return null
-    }
-
-    val loaded = runCatching { Typeface.createFromFile(dest) }.getOrNull()
-    if (loaded == null) {
+    if (!NerdFontPacks.isValidAndroidFontFile(dest)) {
         dest.delete()
         return null
     }

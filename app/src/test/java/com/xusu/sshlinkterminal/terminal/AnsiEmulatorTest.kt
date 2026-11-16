@@ -79,4 +79,92 @@ class AnsiEmulatorTest {
         val lines = emulator.snapshotLines().map { it.plainText }
         assertTrue(lines.any { it.contains("!") })
     }
+
+    @Test
+    fun `responds to DA1 DA2 XTVERSION DSR DECRQM and OSC color queries immediately`() {
+        val replies = mutableListOf<String>()
+        val emulator = AnsiEmulator(
+            initialCols = 40,
+            initialRows = 10,
+            onTerminalResponse = { replies += it }
+        )
+
+        emulator.feedText("ab")
+        emulator.feedText("\u001B[c")
+        emulator.feedText("\u001B[0c")
+        emulator.feedText("\u001BZ")
+        emulator.feedText("\u001B[>c")
+        emulator.feedText("\u001B[>0q")
+        emulator.feedText("\u001B[5n")
+        emulator.feedText("\u001B[6n")
+        emulator.feedText("\u001B[?6n")
+        emulator.feedText("\u001B[?2026\$p")
+        emulator.feedText("\u001B]10;?\u0007")
+        emulator.feedText("\u001B]11;?\u001B\\")
+
+        assertEquals(
+            listOf(
+                "\u001B[?62;22c",
+                "\u001B[?62;22c",
+                "\u001B[?62;22c",
+                "\u001B[>0;10;1c",
+                "\u001BP>|LinkTerm(1.0.8)\u001B\\",
+                "\u001B[0n",
+                "\u001B[1;3R",
+                "\u001B[?1;3R",
+                "\u001B[?2026;0\$y",
+                "\u001B]10;rgb:e2e2/e8e8/f0f0\u001B\\",
+                "\u001B]11;rgb:0707/0b0b/1212\u001B\\"
+            ),
+            replies
+        )
+    }
+
+    @Test
+    fun `handles charset designation DCS APC colon SGR and ignores private equals less CSI`() {
+        val replies = mutableListOf<String>()
+        val emulator = AnsiEmulator(
+            initialCols = 40,
+            initialRows = 6,
+            onTerminalResponse = { replies += it }
+        )
+
+        emulator.feedText("\u001B(Bhi\u001B)0")
+        emulator.feedText("\u001BP+q544e\u001B\\")
+        emulator.feedText("\u001B_Gi=1\u001B\\")
+        emulator.feedText("\u001B[=c\u001B[<u")
+        emulator.feedText("\u001B[4:3;38:2::255:128:64mOK\u001B[0m")
+        emulator.feedText("\u001B]10;?;?\u0007")
+
+        val lines = emulator.snapshotLines()
+        assertEquals("hiOK", lines[0].plainText)
+        val okSpan = lines[0].spans.last()
+        assertEquals("OK", okSpan.text)
+        assertTrue(okSpan.style.underline)
+        assertEquals(0xFFFF8040.toInt(), okSpan.style.fgRgb)
+        assertEquals(
+            listOf(
+                "\u001B]10;rgb:e2e2/e8e8/f0f0\u001B\\",
+                "\u001B]11;rgb:0707/0b0b/1212\u001B\\"
+            ),
+            replies
+        )
+
+        // Interrupted escape / incomplete UTF-8 followed by clear() recovers cleanly
+        emulator.feedBytes(byteArrayOf(0x1B, '['.code.toByte(), 0xE4.toByte()))
+        emulator.clear()
+        emulator.feedText("clean")
+        assertEquals("clean", emulator.snapshotLines()[0].plainText)
+    }
+
+    @Test
+    fun `wraps high surrogate cleanly at line end without splitting surrogate pair`() {
+        val emulator = AnsiEmulator(initialCols = 20, initialRows = 8)
+        val prefix = "a".repeat(19)
+        emulator.feedText(prefix + "\uD83D\uDE00")
+        val lines = emulator.snapshotLines().map { it.plainText }
+        assertEquals(2, lines.size)
+        assertEquals(prefix, lines[0])
+        assertEquals("\uD83D\uDE00", lines[1])
+    }
 }
