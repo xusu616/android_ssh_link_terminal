@@ -59,9 +59,12 @@ import com.xusu.sshlinkterminal.data.SessionState
 import com.xusu.sshlinkterminal.service.TerminalForegroundService
 import com.xusu.sshlinkterminal.terminal.NerdFontPacks
 import com.xusu.sshlinkterminal.ui.components.GuardStatusOverlay
+import com.xusu.sshlinkterminal.ui.glass.LocalGlassSidebarLightMask
 import com.xusu.sshlinkterminal.ui.glass.NarrowRailWidth
 import com.xusu.sshlinkterminal.ui.glass.ResponsiveSideMenuLayout
 import com.xusu.sshlinkterminal.ui.glass.SideMenuItem
+import com.xusu.sshlinkterminal.ui.glass.glassSidebarPrimaryText
+import com.xusu.sshlinkterminal.ui.glass.glassSidebarSecondaryText
 import com.xusu.sshlinkterminal.ui.glass.rememberSideMenuState
 import com.xusu.sshlinkterminal.ui.screens.AppearanceSettingsScreen
 import com.xusu.sshlinkterminal.ui.screens.DashboardScreen
@@ -313,17 +316,18 @@ class MainActivity : ComponentActivity() {
                                 showWallpaper = uiPrefs.showWallpaper,
                                 onNavigate = { route -> navController.navigate(route) },
                                 drawerHeader = {
+                                    val lightMask = LocalGlassSidebarLightMask.current
                                     Column(Modifier.padding(horizontal = 20.dp, vertical = 18.dp)) {
                                         Text(
                                             "SSH Link Terminal",
                                             style = MaterialTheme.typography.titleLarge,
                                             fontWeight = FontWeight.Bold,
-                                            color = Color(0xFF9CA3AF)
+                                            color = glassSidebarPrimaryText(lightMask)
                                         )
                                         Text(
                                             "Shizuku 守护 · 防断连 · 链接直跳",
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = Color(0xFF6B7280)
+                                            color = glassSidebarSecondaryText(lightMask)
                                         )
                                         Spacer(Modifier.height(10.dp))
                                     }

@@ -1735,7 +1735,9 @@ private fun TerminalSessionSidebarOverlay(
                             hazeState = hazeState,
                             blurIntensity = blurRadius.coerceAtLeast(22f),
                             darkTint = Color(0xFF0A101E).copy(alpha = 0.80f),
-                            darkFallback = Color(0xFF0B1120).copy(alpha = 0.95f)
+                            lightTint = Color(0xFF0A101E).copy(alpha = 0.80f),
+                            darkFallback = Color(0xFF0B1120).copy(alpha = 0.95f),
+                            lightFallback = Color(0xFF0B1120).copy(alpha = 0.95f)
                         )
                     } else {
                         Modifier.background(Color(0xFF0B1120).copy(alpha = 0.97f))

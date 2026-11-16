@@ -64,7 +64,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedIconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Stable
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -279,6 +281,14 @@ data class SideMenuItem(
     val icon: ImageVector
 )
 
+internal val LocalGlassSidebarLightMask = compositionLocalOf { false }
+
+internal fun glassSidebarPrimaryText(lightMask: Boolean): Color =
+    if (lightMask) Color(0xFF0F172A) else Color.White
+
+internal fun glassSidebarSecondaryText(lightMask: Boolean): Color =
+    if (lightMask) Color(0xFF334155) else Color.White.copy(alpha = 0.74f)
+
 @Composable
 fun GlassSidebarBox(
     hazeState: HazeState,
@@ -287,6 +297,7 @@ fun GlassSidebarBox(
     onDismiss: () -> Unit = {},
     content: @Composable ColumnScope.() -> Unit
 ) {
+    val isLightMask = showWallpaper && !isSystemInDarkTheme()
     val shape = RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp)
     Box(
         modifier = Modifier
@@ -308,8 +319,8 @@ fun GlassSidebarBox(
             .border(
                 width = 1.dp,
                 brush = Brush.verticalGradient(
-                    0f to Color.White.copy(alpha = 0.18f),
-                    1f to Color.White.copy(alpha = 0.06f)
+                    0f to if (isLightMask) Color(0xFF0F172A).copy(alpha = 0.14f) else Color.White.copy(alpha = 0.18f),
+                    1f to if (isLightMask) Color(0xFF0F172A).copy(alpha = 0.06f) else Color.White.copy(alpha = 0.06f)
                 ),
                 shape = shape
             )
@@ -320,15 +331,17 @@ fun GlassSidebarBox(
                 onClick = onDismiss
             )
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .statusBarsPadding()
-                .navigationBarsPadding()
-                .padding(bottom = 24.dp),
-            content = content
-        )
+        CompositionLocalProvider(LocalGlassSidebarLightMask provides isLightMask) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .statusBarsPadding()
+                    .navigationBarsPadding()
+                    .padding(bottom = 24.dp),
+                content = content
+            )
+        }
     }
 }
 
@@ -341,6 +354,7 @@ fun SideMenuRow(
     selected: Boolean,
     onClick: () -> Unit
 ) {
+    val lightMask = LocalGlassSidebarLightMask.current
     val iconBg = if (colorBag.useM3Color) MaterialTheme.colorScheme.primary else colorBag.vibrant
     val iconFg = if (colorBag.useM3Color) MaterialTheme.colorScheme.onPrimary else contrastOnColor(iconBg)
     Row(
@@ -378,12 +392,12 @@ fun SideMenuRow(
                 text = title,
                 style = MaterialTheme.typography.bodyLarge,
                 fontWeight = FontWeight.SemiBold,
-                color = Color(0xFF9CA3AF)
+                color = glassSidebarPrimaryText(lightMask)
             )
             Text(
                 text = subtitle,
                 style = MaterialTheme.typography.labelSmall,
-                color = Color(0xFF6B7280)
+                color = glassSidebarSecondaryText(lightMask)
             )
         }
     }
