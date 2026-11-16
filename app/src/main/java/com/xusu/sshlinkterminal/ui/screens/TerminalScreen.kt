@@ -518,10 +518,14 @@ fun TerminalScreen(
 
                     DropdownMenu(
                         expanded = hostMenuExpanded,
-                        onDismissRequest = { hostMenuExpanded = false }
+                        onDismissRequest = { hostMenuExpanded = false },
+                        shape = RoundedCornerShape(16.dp)
                     ) {
                         if (currentHost != null) {
                             DropdownMenuItem(
+                                modifier = Modifier
+                                    .padding(horizontal = 4.dp)
+                                    .clip(RoundedCornerShape(8.dp)),
                                 text = {
                                     Text(
                                         text = "新建同主机对话 (${currentHost.name})",
@@ -1756,11 +1760,11 @@ private fun TerminalSessionSidebarOverlay(
                         onDragCancel = { latestOnFinishDrag(lastDrawerDelta) }
                     )
                 }
-                // Consume background taps inside drawer without closing it accidentally
+                // Option rows consume their own clicks; tapping blank/header areas dismisses the drawer.
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
-                    onClick = {}
+                    onClick = onDismiss
                 )
         ) {
             Column(

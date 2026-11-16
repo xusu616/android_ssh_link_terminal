@@ -1,5 +1,6 @@
 package com.xusu.sshlinkterminal.ui.screens
 
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
@@ -79,6 +80,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xusu.sshlinkterminal.BuildConfig
@@ -104,6 +106,7 @@ import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import androidx.core.net.toUri
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -1117,6 +1120,7 @@ private fun PrefSwitchRow(
     }
 }
 
+@SuppressLint("UseKtx")
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LogsAndAboutScreen(
@@ -1177,11 +1181,11 @@ fun LogsAndAboutScreen(
                         OutlinedButton(onClick = {
                             val intent = Intent(
                                 Intent.ACTION_VIEW,
-                                Uri.parse("https://gitlab.com/xusu616/android_ssh_link_terminal")
+                                "https://gitlab.com/xusu616/android_ssh_link_terminal".toUri()
                             )
                             context.startActivity(intent)
                         }) {
-                            Text("打开 GitLab")
+                            Text("打开 GitLab", fontSize =13.sp, fontWeight = FontWeight.ExtraBold);
                         }
                     }
                 }
@@ -1226,6 +1230,15 @@ fun LogsAndAboutScreen(
     }
 }
 
+@Preview
+@Composable
+fun LogsAndAboutScreenPreview() {
+    LogsAndAboutScreen(
+        logs = emptyList(),
+        onBack = {},
+        onClearLogs = {}
+    )
+}
 private suspend fun checkGitLabRelease(): String = withContext(Dispatchers.IO) {
     try {
         val url = URL("https://gitlab.com/api/v4/projects/xusu616%2Fandroid_ssh_link_terminal/releases")
