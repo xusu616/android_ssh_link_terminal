@@ -318,12 +318,12 @@ class MainActivity : ComponentActivity() {
                                             "SSH Link Terminal",
                                             style = MaterialTheme.typography.titleLarge,
                                             fontWeight = FontWeight.Bold,
-                                            color = Color.White
+                                            color = Color(0xFF9CA3AF)
                                         )
                                         Text(
                                             "Shizuku 守护 · 防断连 · 链接直跳",
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = Color.White.copy(alpha = 0.72f)
+                                            color = Color(0xFF6B7280)
                                         )
                                         Spacer(Modifier.height(10.dp))
                                     }
