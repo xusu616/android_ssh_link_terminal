@@ -62,7 +62,10 @@ data class SessionUiSnapshot(
     val terminalRevision: Long = 0L,
     val detectedAuthLink: DetectedAuthLink? = null,
     val pendingInteractivePrompt: InteractivePromptRequest? = null,
-    val windowTitle: String = ""
+    val windowTitle: String = "",
+    val ptyCols: Int = 80,
+    val ptyRows: Int = 28,
+    val hasCustomPtySize: Boolean = false
 )
 
 class SshSessionController(
@@ -79,8 +82,10 @@ class SshSessionController(
     @OptIn(ExperimentalCoroutinesApi::class)
     private val uiSyncDispatcher = Dispatchers.IO.limitedParallelism(1)
     private val connectMutex = Mutex()
+    private val snapshotApplyLock = Any()
     private val connectionGen = AtomicLong(0L)
     private val emulator = AnsiEmulator(initialCols = 80, initialRows = 28, onTerminalResponse = ::sendText)
+    private var appliedMutationSeq = -1L
 
     @Volatile
     var hostProfile: HostProfile = initialHost
@@ -124,8 +129,17 @@ class SshSessionController(
     @Volatile
     private var lastRows = 28
 
+    @Volatile
+    private var hasCustomPtySize = false
+
+    @Volatile
+    private var reviveNoticeShown = false
+
     private var pendingPromptDeferred: CompletableDeferred<List<String>?>? = null
     private val authRollingBuffer = StringBuilder()
+
+    private fun sessionLabel(host: HostProfile = hostProfile): String =
+        if (sessionIndex <= 1) host.name else "${host.name} #$sessionIndex"
 
     fun updateHostProfile(updated: HostProfile) {
         hostProfile = updated
@@ -149,12 +163,7 @@ class SshSessionController(
 
     fun connect(forceRestart: Boolean = false) {
         val currentState = _snapshot.value.state
-        if (!forceRestart && (currentState == SessionState.CONNECTED ||
-                currentState == SessionState.CONNECTING ||
-                currentState == SessionState.RECONNECTING ||
-                currentState == SessionState.AWAITING_INPUT ||
-                currentState == SessionState.AWAITING_OAUTH)
-        ) {
+        if (!forceRestart && (currentState.isActiveChannel() || currentState == SessionState.RECONNECTING)) {
             return
         }
         TerminalForegroundService.ensureStarted(context)
@@ -194,6 +203,7 @@ class SshSessionController(
             )
         }
         scope.launch(uiSyncDispatcher) {
+            emulator.exitAltScreenIfActive()
             appendSystemLine("\r\n\u001B[33m[已手动断开连接]\u001B[0m\r\n")
         }
     }
@@ -238,18 +248,33 @@ class SshSessionController(
     fun resizePty(cols: Int, rows: Int) {
         val safeCols = cols.coerceIn(24, 220)
         val safeRows = rows.coerceIn(10, 100)
-        if (safeCols == lastCols && safeRows == lastRows) return
+        val dimsChanged = safeCols != lastCols || safeRows != lastRows
+        val firstCustomSize = !hasCustomPtySize
+        hasCustomPtySize = true
+        if (!dimsChanged && !firstCustomSize) return
         lastCols = safeCols
         lastRows = safeRows
         scope.launch(uiSyncDispatcher) {
-            emulator.resize(safeCols, safeRows)
+            if (dimsChanged) {
+                emulator.resize(safeCols, safeRows)
+            }
             refreshTerminalSnapshot()
         }
-        scope.launch(writeDispatcher) {
-            try {
-                shellChannel?.setPtySize(safeCols, safeRows, 0, 0)
-            } catch (_: Throwable) {
+        if (dimsChanged) {
+            scope.launch(writeDispatcher) {
+                try {
+                    shellChannel?.setPtySize(safeCols, safeRows, 0, 0)
+                } catch (_: Throwable) {
+                }
             }
+        }
+    }
+
+    fun appendNoticeOnce(ansiMessage: String) {
+        if (reviveNoticeShown || ansiMessage.isBlank()) return
+        reviveNoticeShown = true
+        scope.launch(uiSyncDispatcher) {
+            appendSystemLine(ansiMessage)
         }
     }
 
@@ -294,16 +319,21 @@ class SshSessionController(
             }
             appendSystemLine("\r\n\u001B[36m[LinkTerm] 连接 ${currentHost.username}@${currentHost.host}:${currentHost.port}...\u001B[0m\r\n")
 
+            val label = sessionLabel(currentHost)
             var unexpectedFailureMessage: String? = null
             try {
                 establishAndStreamSession(currentHost, gen)
                 if (isAttemptActive(gen, currentCoroutineContext().isActive)) {
-                    unexpectedFailureMessage = "远端会话已关闭"
+                    emulator.exitAltScreenIfActive()
+                    unexpectedFailureMessage = "远端会话已关闭 (EOF)"
+                    repository.appendLog("WARN", "SSH", "$label: 远端通道已关闭 (EOF)")
+                    appendSystemLine("\r\n\u001B[33m[远端会话已关闭 (EOF)，连接已断开]\u001B[0m\r\n")
                 }
             } catch (e: Exception) {
                 if (isAttemptActive(gen, currentCoroutineContext().isActive)) {
+                    emulator.exitAltScreenIfActive()
                     unexpectedFailureMessage = e.message ?: e::class.java.simpleName
-                    repository.appendLog("WARN", "SSH", "${currentHost.name}: 连接中断 - $unexpectedFailureMessage")
+                    repository.appendLog("WARN", "SSH", "$label: 连接中断 - $unexpectedFailureMessage")
                     appendSystemLine("\r\n\u001B[31m[连接异常: $unexpectedFailureMessage]\u001B[0m\r\n")
                 }
             } finally {
@@ -348,6 +378,7 @@ class SshSessionController(
     }
 
     private suspend fun establishAndStreamSession(host: HostProfile, gen: Long) = withContext(Dispatchers.IO) {
+        emulator.exitAltScreenIfActive()
         emulator.resetParserState()
         val jsch = JSch()
         configureIdentities(jsch, host)
@@ -408,7 +439,7 @@ class SshSessionController(
                     pendingInteractivePrompt = null
                 )
             }
-            val label = if (sessionIndex <= 1) host.name else "${host.name} #$sessionIndex"
+            val label = sessionLabel(host)
             repository.appendLog("INFO", "SSH", "$label: SSH 会话已建立")
 
             // Start heartbeat RTT probe at a gentle cadence to populate chart telemetry without flooding idle sockets.
@@ -648,14 +679,20 @@ class SshSessionController(
     }
 
     private fun refreshTerminalSnapshot() {
-        val lines = emulator.snapshotLines()
-        val title = emulator.windowTitle
-        _snapshot.update {
-            it.copy(
-                terminalLines = lines,
-                terminalRevision = it.terminalRevision + 1L,
-                windowTitle = title
-            )
+        synchronized(snapshotApplyLock) {
+            val snap = emulator.snapshotState()
+            if (snap.sequence < appliedMutationSeq) return
+            appliedMutationSeq = snap.sequence
+            _snapshot.update {
+                it.copy(
+                    terminalLines = snap.lines,
+                    terminalRevision = it.terminalRevision + 1L,
+                    windowTitle = snap.windowTitle,
+                    ptyCols = lastCols,
+                    ptyRows = lastRows,
+                    hasCustomPtySize = hasCustomPtySize
+                )
+            }
         }
     }
 
@@ -793,6 +830,42 @@ class SshSessionManager(
         return created
     }
 
+    fun openOrSelectHost(host: HostProfile) {
+        val shouldConnect = synchronized(managerLock) {
+            val hostControllers = controllers.values.filter { it.hostProfile.id == host.id }
+            if (hostControllers.isEmpty() || hostControllers.all { it.snapshot.value.state == SessionState.IDLE }) {
+                true
+            } else {
+                _activeHostId.value = host.id
+                _activeSessionId.value = findPrimaryControllerForHostLocked(host.id)?.sessionId
+                false
+            }
+        }
+        if (shouldConnect) {
+            openAndConnect(host)
+        }
+    }
+
+    fun resolvePreferredHost(hosts: List<HostProfile>, requestedHostId: String? = null): HostProfile? {
+        val (activeSessionHostId, activeHostId, liveHostIds) = synchronized(managerLock) {
+            Triple(
+                _activeSessionId.value?.let { controllers[it]?.hostProfile?.id },
+                _activeHostId.value,
+                controllers.values
+                    .filter { it.snapshot.value.state.isActiveChannel() || it.snapshot.value.state == SessionState.RECONNECTING }
+                    .map { it.hostProfile.id }
+                    .toSet()
+            )
+        }
+        return resolveHostSelection(
+            hosts = hosts,
+            requestedHostId = requestedHostId,
+            activeSessionHostId = activeSessionHostId,
+            activeHostId = activeHostId,
+            liveSessionHostIds = liveHostIds
+        )
+    }
+
     fun openAndConnect(host: HostProfile) {
         val controller = synchronized(managerLock) {
             getOrCreateController(host).also {
@@ -854,17 +927,24 @@ class SshSessionManager(
     fun reconnectAll() {
         val list = synchronized(managerLock) { controllers.values.toList() }
         list.forEach { controller ->
-            if (controller.hostProfile.pinInDaemon || controller.snapshot.value.state != SessionState.IDLE) {
-                controller.connect(forceRestart = true)
+            val state = controller.snapshot.value.state
+            if (shouldReconnectOnAction(state, controller.hostProfile.pinInDaemon)) {
+                controller.connect(forceRestart = state == SessionState.RECONNECTING)
             }
         }
     }
 
-    fun restorePinnedHosts() {
+    fun restorePinnedHosts(reviveReason: String? = null) {
         repository.hosts.value
             .filter { it.pinInDaemon }
             .forEach { host ->
-                getOrCreateController(host).connect()
+                val controller = getOrCreateController(host)
+                val shouldNotifyRevive = !reviveReason.isNullOrBlank() &&
+                    controller.snapshot.value.state == SessionState.IDLE
+                if (shouldNotifyRevive) {
+                    controller.appendNoticeOnce("\r\n\u001B[33m$reviveReason\u001B[0m\r\n")
+                }
+                controller.connect()
             }
     }
 
@@ -902,14 +982,41 @@ class SshSessionManager(
 
     fun activeConnectedCount(): Int =
         _snapshots.value.values.count {
-            it.state == SessionState.CONNECTED ||
-                it.state == SessionState.CONNECTING ||
-                it.state == SessionState.AWAITING_OAUTH ||
-                it.state == SessionState.RECONNECTING
+            it.state.isActiveChannel() || it.state == SessionState.RECONNECTING
         }
 
     fun averageRttMs(): Long? {
         val rtts = _snapshots.value.values.mapNotNull { it.lastRttMs }
         return if (rtts.isEmpty()) null else rtts.average().toLong()
+    }
+
+    companion object {
+        internal fun shouldReconnectOnAction(state: SessionState, pinInDaemon: Boolean): Boolean = when (state) {
+            SessionState.CONNECTED,
+            SessionState.CONNECTING,
+            SessionState.AWAITING_INPUT,
+            SessionState.AWAITING_OAUTH -> false
+            SessionState.RECONNECTING,
+            SessionState.DISCONNECTED,
+            SessionState.ERROR -> true
+            SessionState.IDLE -> pinInDaemon
+        }
+
+        internal fun resolveHostSelection(
+            hosts: List<HostProfile>,
+            requestedHostId: String?,
+            activeSessionHostId: String?,
+            activeHostId: String?,
+            liveSessionHostIds: Set<String>
+        ): HostProfile? {
+            if (hosts.isEmpty()) return null
+            if (requestedHostId != null) {
+                return hosts.firstOrNull { it.id == requestedHostId } ?: hosts.firstOrNull()
+            }
+            return activeSessionHostId?.let { id -> hosts.firstOrNull { it.id == id } }
+                ?: activeHostId?.let { id -> hosts.firstOrNull { it.id == id } }
+                ?: hosts.firstOrNull { it.id in liveSessionHostIds }
+                ?: hosts.firstOrNull()
+        }
     }
 }

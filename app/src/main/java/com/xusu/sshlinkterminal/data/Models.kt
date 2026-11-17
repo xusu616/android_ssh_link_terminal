@@ -17,7 +17,15 @@ enum class SessionState {
     CONNECTED,
     RECONNECTING,
     DISCONNECTED,
-    ERROR
+    ERROR;
+
+    fun isActiveChannel(): Boolean = when (this) {
+        CONNECTED,
+        CONNECTING,
+        AWAITING_INPUT,
+        AWAITING_OAUTH -> true
+        else -> false
+    }
 }
 
 enum class MacroCategory {

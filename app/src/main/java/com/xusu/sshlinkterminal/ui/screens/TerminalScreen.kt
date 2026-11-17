@@ -183,6 +183,13 @@ import kotlin.math.ceil
 
 private const val IME_SENTINEL = " "
 
+private data class TerminalConfirmAction(
+    val title: String,
+    val message: String,
+    val confirmLabel: String,
+    val onConfirm: () -> Unit
+)
+
 @Composable
 fun TerminalScreen(
     heroBitmap: ImageBitmap?,
@@ -263,6 +270,7 @@ fun TerminalScreen(
     var ctrlLocked by remember { mutableStateOf(false) }
     var altLocked by remember { mutableStateOf(false) }
     var showDeployKeyDialog by remember { mutableStateOf(false) }
+    var pendingConfirmAction by remember { mutableStateOf<TerminalConfirmAction?>(null) }
     var quickCommandLine by remember { mutableStateOf("") }
     var showQuickBar by remember { mutableStateOf(false) }
     var selection by remember(activeActionKey) { mutableStateOf<TerminalSelection?>(null) }
@@ -495,7 +503,7 @@ fun TerminalScreen(
                                     modifier = Modifier.padding(start = 4.dp)
                                 ) {
                                     Text(
-                                        text = "#${activeSnap.sessionIndex}",
+                                        text = "#${activeSnap.sessionIndex}/${hostSessions.size}",
                                         color = Color.White,
                                         fontSize = 10.sp,
                                         fontWeight = FontWeight.Bold,
@@ -659,7 +667,18 @@ fun TerminalScreen(
                 IconButton(
                     onClick = {
                         currentHost?.let { host ->
-                            onReconnectSession(activeActionKey ?: host.id, host)
+                            val targetKey = activeActionKey ?: host.id
+                            val activeSnap = currentSnapshot
+                            if (activeSnap != null && activeSnap.state.isActiveChannel()) {
+                                pendingConfirmAction = TerminalConfirmAction(
+                                    title = "确认重连当前会话？",
+                                    message = "当前会话（${host.name} #${activeSnap.sessionIndex}）仍处于在线状态，重连会断开现有 SSH 通道并结束前台正在运行的交互程序。",
+                                    confirmLabel = "仍要重连",
+                                    onConfirm = { onReconnectSession(targetKey, host) }
+                                )
+                            } else {
+                                onReconnectSession(targetKey, host)
+                            }
                         }
                     },
                     modifier = Modifier.size(34.dp)
@@ -667,7 +686,19 @@ fun TerminalScreen(
                     Icon(Icons.Rounded.Refresh, contentDescription = "重连", tint = Color(0xFFCBD5E1), modifier = Modifier.size(18.dp))
                 }
                 IconButton(
-                    onClick = { currentSessionKey?.let(onClearTerminal) },
+                    onClick = {
+                        val key = currentSessionKey ?: return@IconButton
+                        if (lines.any { it.plainText.isNotBlank() }) {
+                            pendingConfirmAction = TerminalConfirmAction(
+                                title = "确认清空终端屏幕缓存？",
+                                message = "仅清空本机显示与滚动历史，不会断开 SSH 连接或终止远端进程。",
+                                confirmLabel = "清空",
+                                onConfirm = { onClearTerminal(key) }
+                            )
+                        } else {
+                            onClearTerminal(key)
+                        }
+                    },
                     modifier = Modifier.size(34.dp)
                 ) {
                     Icon(Icons.Rounded.CleaningServices, contentDescription = "清屏", tint = Color(0xFFCBD5E1), modifier = Modifier.size(18.dp))
@@ -819,8 +850,12 @@ fun TerminalScreen(
                 val isImeVisible = WindowInsets.ime.getBottom(density) > 0
                 val hasOverlayBar = authLink != null || showQuickBar
 
-                var lastSentCols by remember(currentSessionKey) { mutableIntStateOf(-1) }
-                var lastSentRows by remember(currentSessionKey) { mutableIntStateOf(-1) }
+                var lastSentCols by remember(currentSessionKey) {
+                    mutableIntStateOf(currentSnapshot?.takeIf { it.hasCustomPtySize }?.ptyCols ?: -1)
+                }
+                var lastSentRows by remember(currentSessionKey) {
+                    mutableIntStateOf(currentSnapshot?.takeIf { it.hasCustomPtySize }?.ptyRows ?: -1)
+                }
 
                 // Keep remote PTY rows stable while IME or OAuth banner opens/closes so CLIs (like agy) do not SIGWINCH-refresh.
                 LaunchedEffect(currentSessionKey, cols, rawRows, isImeVisible, hasOverlayBar) {
@@ -1567,7 +1602,19 @@ fun TerminalScreen(
                     onSelectSession(sid)
                     animateDrawerTo(0f)
                 },
-                onCloseSession = { sid -> onCloseSession(sid) },
+                onCloseSession = { sid ->
+                    val target = sessions[sid]
+                    if (target != null && target.state.isActiveChannel()) {
+                        pendingConfirmAction = TerminalConfirmAction(
+                            title = "确认关闭会话 #${target.sessionIndex}？",
+                            message = "${target.hostName} 的该会话当前在线，关闭会断开通道并终止该会话中运行的远端进程。",
+                            confirmLabel = "关闭会话",
+                            onConfirm = { onCloseSession(sid) }
+                        )
+                    } else {
+                        onCloseSession(sid)
+                    }
+                },
                 onNewSession = { host ->
                     onNewSession(host)
                     animateDrawerTo(0f)
@@ -1665,6 +1712,29 @@ fun TerminalScreen(
             },
             confirmButton = {
                 TextButton(onClick = { showDeployKeyDialog = false }) { Text("关闭") }
+            }
+        )
+    }
+
+    pendingConfirmAction?.let { action ->
+        AlertDialog(
+            onDismissRequest = { pendingConfirmAction = null },
+            title = { Text(action.title) },
+            text = { Text(action.message, style = MaterialTheme.typography.bodySmall) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingConfirmAction = null
+                        action.onConfirm()
+                    }
+                ) {
+                    Text(action.confirmLabel, color = Color(0xFFF87171))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingConfirmAction = null }) {
+                    Text("取消")
+                }
             }
         )
     }

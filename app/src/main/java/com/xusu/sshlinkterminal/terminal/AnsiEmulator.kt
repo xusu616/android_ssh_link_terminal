@@ -24,6 +24,12 @@ data class TerminalRenderLine(
     val plainText: String
 )
 
+data class TerminalSnapshotState(
+    val lines: List<TerminalRenderLine>,
+    val windowTitle: String,
+    val sequence: Long
+)
+
 private data class Cell(
     var ch: Char = ' ',
     var style: TerminalStyle = TerminalStyle(),
@@ -86,6 +92,7 @@ class AnsiEmulator(
 
     private val lock = Any()
     private val responseQueue = ArrayList<String>(4)
+    private var mutationSeq = 0L
 
     fun resize(newCols: Int, newRows: Int): Unit = synchronized(lock) {
         val targetCols = newCols.coerceIn(20, 240)
@@ -128,6 +135,7 @@ class AnsiEmulator(
             cursorRow = (cursorRow - primaryDrop).coerceIn(0, rows - 1)
         }
         cursorCol = cursorCol.coerceIn(0, cols - 1)
+        mutationSeq++
     }
 
     fun feedBytes(bytes: ByteArray, length: Int = bytes.size): String {
@@ -157,6 +165,7 @@ class AnsiEmulator(
                 for (ch in text) {
                     processChar(ch)
                 }
+                mutationSeq++
             }
             responses = drainResponsesLocked()
             text
@@ -169,6 +178,9 @@ class AnsiEmulator(
         val responses = synchronized(lock) {
             for (ch in text) {
                 processChar(ch)
+            }
+            if (text.isNotEmpty()) {
+                mutationSeq++
             }
             drainResponsesLocked()
         }
@@ -199,6 +211,17 @@ class AnsiEmulator(
         resetParserLocked()
     }
 
+    /**
+     * Leaves the alternate screen buffer if active (e.g. when a TUI process ends due to transport
+     * disconnect), restoring the primary screen and scrollback visibility.
+     */
+    fun exitAltScreenIfActive(): Boolean = synchronized(lock) {
+        if (!usingAltScreen) return@synchronized false
+        switchToAltScreen(false)
+        mutationSeq++
+        true
+    }
+
     fun clear() = synchronized(lock) {
         scrollback.clear()
         primaryScreen = createScreen(rows, cols)
@@ -214,9 +237,22 @@ class AnsiEmulator(
         currentOscLink = null
         windowTitle = ""
         resetParserLocked()
+        mutationSeq++
+    }
+
+    fun snapshotState(): TerminalSnapshotState = synchronized(lock) {
+        TerminalSnapshotState(
+            lines = snapshotLinesLocked(),
+            windowTitle = windowTitle,
+            sequence = mutationSeq
+        )
     }
 
     fun snapshotLines(): List<TerminalRenderLine> = synchronized(lock) {
+        snapshotLinesLocked()
+    }
+
+    private fun snapshotLinesLocked(): List<TerminalRenderLine> {
         val allRows = ArrayList<Array<Cell>>(scrollback.size + rows)
         if (!usingAltScreen) {
             allRows.addAll(scrollback)

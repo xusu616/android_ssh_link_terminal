@@ -356,25 +356,16 @@ class MainActivity : ComponentActivity() {
                                             showGuardCard = true
                                         },
                                         onOpenTerminalScreen = { hostId ->
-                                            val target = hostId?.let { id -> hosts.firstOrNull { it.id == id } } ?: hosts.firstOrNull()
+                                            val target = app.sshManager.resolvePreferredHost(hosts, hostId)
                                             if (target != null) {
-                                                val hostSnaps = sessions.values.filter { it.hostId == target.id }
-                                                if (hostSnaps.isEmpty() || hostSnaps.all { it.state == SessionState.IDLE }) {
-                                                    app.sshManager.openAndConnect(target)
-                                                } else {
-                                                    app.sshManager.selectHost(target.id)
-                                                }
+                                                app.sshManager.openOrSelectHost(target)
                                             }
                                             navController.navigate(Routes.TERMINAL)
                                         },
                                         onDisconnectHost = { hostId -> app.sshManager.disconnectHost(hostId) },
                                         onToggleGuardianAll = {
                                             val hasRunning = guardStatus.foregroundServiceRunning || sessions.values.any {
-                                                it.state == SessionState.CONNECTED ||
-                                                    it.state == SessionState.CONNECTING ||
-                                                    it.state == SessionState.RECONNECTING ||
-                                                    it.state == SessionState.AWAITING_OAUTH ||
-                                                    it.state == SessionState.AWAITING_INPUT
+                                                it.state.isActiveChannel() || it.state == SessionState.RECONNECTING
                                             }
                                             if (hasRunning) {
                                                 app.sshManager.disconnectAll()
@@ -474,12 +465,7 @@ class MainActivity : ComponentActivity() {
                                 macros = macros,
                                 onBack = { navController.popBackStack() },
                                 onSelectHost = { host ->
-                                    val hostSnaps = sessions.values.filter { it.hostId == host.id }
-                                    if (hostSnaps.isEmpty() || hostSnaps.all { it.state == SessionState.IDLE }) {
-                                        app.sshManager.openAndConnect(host)
-                                    } else {
-                                        app.sshManager.selectHost(host.id)
-                                    }
+                                    app.sshManager.openOrSelectHost(host)
                                 },
                                 onSelectSession = { sessionId ->
                                     app.sshManager.selectSession(sessionId)

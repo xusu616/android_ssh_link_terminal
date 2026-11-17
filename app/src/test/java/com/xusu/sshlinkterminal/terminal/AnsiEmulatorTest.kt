@@ -1,6 +1,7 @@
 package com.xusu.sshlinkterminal.terminal
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.charset.StandardCharsets
@@ -166,5 +167,27 @@ class AnsiEmulatorTest {
         assertEquals(2, lines.size)
         assertEquals(prefix, lines[0])
         assertEquals("\uD83D\uDE00", lines[1])
+    }
+
+    @Test
+    fun `exits alternate screen before reconnect banner and increments snapshot sequence monotonically`() {
+        val emulator = AnsiEmulator(initialCols = 50, initialRows = 8)
+        val seq0 = emulator.snapshotState().sequence
+        emulator.feedText("shell-before-tui\r\n")
+        val seq1 = emulator.snapshotState().sequence
+        assertTrue(seq1 > seq0)
+
+        emulator.feedText("\u001B[?1049h\u001B[2Jagy-running-tui")
+        assertEquals(listOf("agy-running-tui"), emulator.snapshotLines().map { it.plainText })
+
+        assertTrue(emulator.exitAltScreenIfActive())
+        assertFalse(emulator.exitAltScreenIfActive())
+        val seq2 = emulator.snapshotState().sequence
+        assertTrue(seq2 > seq1)
+
+        emulator.feedText("[远端会话已关闭 (EOF)]\r\n")
+        val recovered = emulator.snapshotLines().map { it.plainText }
+        assertTrue("Expected primary screen restored: $recovered", recovered.any { it.contains("shell-before-tui") })
+        assertTrue("Expected EOF notice preserved: $recovered", recovered.any { it.contains("EOF") })
     }
 }

@@ -4,6 +4,6 @@
     <string name="notif_channel_name">SSH 守护与持久会话</string>
     <string name="notif_channel_desc">保持长连接心跳与后台 SSH 会话存活，防止 OAuth 中断</string>
     <string name="action_open_terminal">打开终端</string>
-    <string name="action_reconnect_all">重连全部</string>
+    <string name="action_reconnect_all">重连断线</string>
     <string name="action_stop_guardian">断开全部</string>
 </resources>
