@@ -45,7 +45,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
@@ -172,6 +171,7 @@ import com.xusu.sshlinkterminal.ui.glass.GlassSideMenuWidth
 import com.xusu.sshlinkterminal.ui.glass.bouncySpringSpec
 import com.xusu.sshlinkterminal.ui.glass.glassHaze
 import com.xusu.sshlinkterminal.ui.theme.contrastOnColor
+import com.xusu.sshlinkterminal.ui.theme.topSafeInsetsPadding
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
@@ -442,7 +442,7 @@ fun TerminalScreen(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .statusBarsPadding()
+                    .topSafeInsetsPadding()
                     .navigationBarsPadding()
                     .imePadding()
             ) {
@@ -1842,7 +1842,7 @@ private fun TerminalSessionSidebarOverlay(
             Column(
                 modifier = Modifier
                     .fillMaxSize()
-                    .statusBarsPadding()
+                    .topSafeInsetsPadding()
                     .navigationBarsPadding()
                     .imePadding()
             ) {

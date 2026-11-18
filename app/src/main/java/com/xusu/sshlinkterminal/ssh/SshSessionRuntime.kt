@@ -141,6 +141,10 @@ class SshSessionController(
     private fun sessionLabel(host: HostProfile = hostProfile): String =
         if (sessionIndex <= 1) host.name else "${host.name} #$sessionIndex"
 
+    private companion object {
+        const val RTT_REPLY_TIMEOUT_NANOS = 5_000_000_000L
+    }
+
     fun updateHostProfile(updated: HostProfile) {
         hostProfile = updated
         _snapshot.update {
@@ -384,6 +388,8 @@ class SshSessionController(
         configureIdentities(jsch, host)
 
         val session = jsch.getSession(host.username, host.host, host.port)
+        val rttFactory = RttSocketFactory()
+        session.setSocketFactory(rttFactory)
         var channel: ChannelShell? = null
         var outStream: OutputStream? = null
         try {
@@ -446,20 +452,34 @@ class SshSessionController(
             keepAliveJob?.cancel()
             val probeIntervalMs = maxOf(aliveSec, 30) * 1000L
             keepAliveJob = scope.launch {
+                var firstProbe = true
                 while (isActive && session.isConnected && channel.isConnected && connectionGen.get() == gen) {
-                    delay(probeIntervalMs)
+                    delay(if (firstProbe) 1_500L else probeIntervalMs)
+                    firstProbe = false
                     if (!session.isConnected || !channel.isConnected || connectionGen.get() != gen) break
-                    val start = SystemClock.elapsedRealtime()
                     try {
+                        // sendKeepAliveMsg() returns right after the local socket write, so measure the time
+                        // until the server's reply actually arrives on the wire (real network RTT).
+                        val sentAt = System.nanoTime()
                         session.sendKeepAliveMsg()
-                        val rtt = (SystemClock.elapsedRealtime() - start).coerceAtLeast(1L)
-                        _snapshot.update {
-                            it.copy(
-                                lastRttMs = rtt,
-                                statusDetail = "在线 · ${rtt}ms"
-                            )
+                        val deadline = sentAt + RTT_REPLY_TIMEOUT_NANOS
+                        var rtt: Long? = null
+                        while (isActive && System.nanoTime() < deadline) {
+                            rtt = rttFactory.inboundDelayMsSince(sentAt)
+                            if (rtt != null) break
+                            delay(2L)
                         }
-                        repository.appendRttSample(rttMs = rtt, activeSessions = 1)
+                        if (rtt != null) {
+                            _snapshot.update {
+                                it.copy(
+                                    lastRttMs = rtt,
+                                    statusDetail = "在线 · ${rtt}ms"
+                                )
+                            }
+                            repository.appendRttSample(rttMs = rtt, activeSessions = 1)
+                        } else if (isActive) {
+                            repository.appendLog("WARN", "KeepAlive", "$label: 心跳 ${RTT_REPLY_TIMEOUT_NANOS / 1_000_000_000L}s 内未收到服务器回应")
+                        }
                     } catch (e: Exception) {
                         repository.appendLog("WARN", "KeepAlive", "$label: 心跳异常 ${e.message}")
                         if (!session.isConnected) break

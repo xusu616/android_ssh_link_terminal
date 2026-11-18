@@ -93,7 +93,8 @@ data class UiPreferences(
     val autoStartOnBoot: Boolean = true,
     val topComponentPressedDown: Boolean = true,
     val chartAxisAnimation: Boolean = true,
-    val terminalNonTextInput: Boolean = true
+    val terminalNonTextInput: Boolean = true,
+    val hideStatusBar: Boolean = false
 )
 
 data class ColorBag(

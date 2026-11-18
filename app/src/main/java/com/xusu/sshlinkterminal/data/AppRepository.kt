@@ -300,7 +300,8 @@ class AppRepository(context: Context) {
             autoStartOnBoot = prefs.getBoolean("ui_auto_start_boot", true),
             topComponentPressedDown = prefs.getBoolean("ui_top_pressed_down", true),
             chartAxisAnimation = prefs.getBoolean("ui_chart_axis_anim", true),
-            terminalNonTextInput = prefs.getBoolean("ui_terminal_non_text_input", true)
+            terminalNonTextInput = prefs.getBoolean("ui_terminal_non_text_input", true),
+            hideStatusBar = prefs.getBoolean("ui_hide_status_bar", false)
         )
     }
 
@@ -328,6 +329,7 @@ class AppRepository(context: Context) {
             putBoolean("ui_top_pressed_down", value.topComponentPressedDown)
             putBoolean("ui_chart_axis_anim", value.chartAxisAnimation)
             putBoolean("ui_terminal_non_text_input", value.terminalNonTextInput)
+            putBoolean("ui_hide_status_bar", value.hideStatusBar)
         }
     }
 

@@ -152,9 +152,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            val fontPicker = rememberLauncherForActivityResult(
-                ActivityResultContracts.OpenDocument()
-            ) { uri ->
+            val handlePickedFont: (Uri?) -> Unit = { uri ->
                 if (uri != null) {
                     scope.launch {
                         val imported = withContext(Dispatchers.IO) {
@@ -175,6 +173,26 @@ class MainActivity : ComponentActivity() {
                             Toast.makeText(context, "无法解析所选字体（请选 .ttf / .otf）", Toast.LENGTH_SHORT).show()
                         }
                     }
+                }
+            }
+            val fontPickerDocument = rememberLauncherForActivityResult(OpenFontDocumentContract(), handlePickedFont)
+            val fontPickerChooser = rememberLauncherForActivityResult(ChooseFontFileContract(), handlePickedFont)
+            val launchFontPicker: () -> Unit = {
+                try {
+                    fontPickerDocument.launch(Unit)
+                } catch (_: Exception) {
+                    try {
+                        fontPickerChooser.launch(Unit)
+                    } catch (_: Exception) {
+                        Toast.makeText(context, "未找到可用的文件选择器", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+            val launchFontChooser: () -> Unit = {
+                try {
+                    fontPickerChooser.launch(Unit)
+                } catch (_: Exception) {
+                    Toast.makeText(context, "未找到可用的文件选择器", Toast.LENGTH_SHORT).show()
                 }
             }
 
@@ -287,7 +305,7 @@ class MainActivity : ComponentActivity() {
                 context.startActivity(intent)
             }
 
-            LinkTerminalTheme(darkTheme = true, dynamicColor = uiPrefs.useM3Color) {
+            LinkTerminalTheme(darkTheme = true, dynamicColor = uiPrefs.useM3Color, hideStatusBar = uiPrefs.hideStatusBar) {
                 WallpaperControlsTheme(colorBag = colorBag) {
                     NavHost(
                         navController = navController,
@@ -421,7 +439,8 @@ class MainActivity : ComponentActivity() {
                                             onResetWallpaper = {
                                                 app.repository.updateUiPreferences { it.copy(wallpaperUri = null) }
                                             },
-                                            onPickTerminalFont = { fontPicker.launch(arrayOf("*/*")) },
+                                            onPickTerminalFont = launchFontPicker,
+                                            onPickTerminalFontChooser = launchFontChooser,
                                             onRequestShizuku = ::requestShizukuWithFeedback,
                                             onApplyShizukuHarden = ::applyShizukuHardeningWithFeedback
                                         )
@@ -551,7 +570,8 @@ class MainActivity : ComponentActivity() {
                                 onResetWallpaper = {
                                     app.repository.updateUiPreferences { it.copy(wallpaperUri = null) }
                                 },
-                                onPickTerminalFont = { fontPicker.launch(arrayOf("*/*")) },
+                                onPickTerminalFont = launchFontPicker,
+                                            onPickTerminalFontChooser = launchFontChooser,
                                 onRequestShizuku = ::requestShizukuWithFeedback,
                                 onApplyShizukuHarden = ::applyShizukuHardeningWithFeedback
                             )

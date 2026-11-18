@@ -10,8 +10,13 @@ import android.os.Build
 import android.view.RoundedCorner
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.darkColorScheme
@@ -19,6 +24,9 @@ import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -31,6 +39,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.palette.graphics.Palette
 import com.xusu.sshlinkterminal.R
@@ -48,12 +57,28 @@ fun LinkTerminalTheme(
     val view = LocalView.current
     if (!LocalInspectionMode.current && view.context is Activity) {
         val window = (view.context as Activity).window
-        val controller = WindowCompat.getInsetsController(window, view)
-        if (hideStatusBar) {
-            controller.hide(WindowInsetsCompat.Type.statusBars())
-        } else {
-            controller.show(WindowInsetsCompat.Type.statusBars())
-            controller.isAppearanceLightStatusBars = !darkTheme
+        val applySystemBars = {
+            val controller = WindowCompat.getInsetsController(window, view)
+            if (hideStatusBar) {
+                controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                controller.hide(WindowInsetsCompat.Type.statusBars())
+            } else {
+                controller.show(WindowInsetsCompat.Type.statusBars())
+                controller.isAppearanceLightStatusBars = !darkTheme
+            }
+        }
+        SideEffect { applySystemBars() }
+        // Some ROMs re-show hidden bars after IME / dialog / app-switch focus changes.
+        DisposableEffect(view, hideStatusBar, darkTheme) {
+            val listener = android.view.ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
+                if (hasFocus) applySystemBars()
+            }
+            view.viewTreeObserver.addOnWindowFocusChangeListener(listener)
+            onDispose {
+                if (view.viewTreeObserver.isAlive) {
+                    view.viewTreeObserver.removeOnWindowFocusChangeListener(listener)
+                }
+            }
         }
     }
 
@@ -211,6 +236,16 @@ private fun hslToColor(hsl: FloatArray, alpha: Float = 1f): Color {
 @Composable
 fun getDisplayCutoutTopPadding(): Dp =
     WindowInsets.displayCutout.asPaddingValues().calculateTopPadding()
+
+/**
+ * Top safe-area padding that keeps clear of the status bar when visible and of the camera cutout when
+ * the status bar is hidden (immersive mode), whichever inset is larger.
+ */
+@Composable
+fun Modifier.topSafeInsetsPadding(): Modifier =
+    this.windowInsetsPadding(
+        WindowInsets.statusBars.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top)
+    )
 
 @Composable
 fun getDeviceCornerRadius(): Dp {

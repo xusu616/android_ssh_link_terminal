@@ -41,7 +41,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
@@ -92,6 +91,7 @@ import androidx.compose.ui.unit.sp
 import com.xusu.sshlinkterminal.data.ChartWindowRule
 import com.xusu.sshlinkterminal.data.ColorBag
 import com.xusu.sshlinkterminal.ui.theme.contrastOnColor
+import com.xusu.sshlinkterminal.ui.theme.topSafeInsetsPadding
 import dev.chrisbanes.haze.HazeInputScale
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.blur.HazeColorEffect
@@ -336,7 +336,7 @@ fun GlassSidebarBox(
                 modifier = Modifier
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
-                    .statusBarsPadding()
+                    .topSafeInsetsPadding()
                     .navigationBarsPadding()
                     .padding(bottom = 24.dp),
                 content = content
@@ -618,7 +618,7 @@ fun NarrowGlassRail(
         modifier = modifier
             .width(NarrowRailWidth)
             .fillMaxHeight()
-            .statusBarsPadding()
+            .topSafeInsetsPadding()
             .navigationBarsPadding()
             .padding(vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,

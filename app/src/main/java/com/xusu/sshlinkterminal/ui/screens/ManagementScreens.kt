@@ -497,6 +497,7 @@ fun AppearanceSettingsScreen(
     onPickWallpaper: () -> Unit,
     onResetWallpaper: () -> Unit,
     onPickTerminalFont: () -> Unit,
+    onPickTerminalFontChooser: () -> Unit,
     onRequestShizuku: () -> Unit,
     onApplyShizukuHarden: () -> Unit
 ) {
@@ -604,6 +605,12 @@ fun AppearanceSettingsScreen(
                     onCheckedChange = { checked -> onUpdatePrefs { it.copy(topComponentPressedDown = checked) } }
                 )
                 PrefSwitchRow(
+                    title = "隐藏系统状态栏（沉浸模式）",
+                    subtitle = "全局隐藏顶部状态栏，从屏幕顶部边缘下滑可临时唤出；挖孔屏会自动避让摄像头",
+                    checked = prefs.hideStatusBar,
+                    onCheckedChange = { checked -> onUpdatePrefs { it.copy(hideStatusBar = checked) } }
+                )
+                PrefSwitchRow(
                     title = "弹簧物理动效 & 按钮触感反馈",
                     subtitle = "外置快捷键与侧栏抽屉启用弹簧动画和震动",
                     checked = prefs.springAnimation,
@@ -684,6 +691,9 @@ fun AppearanceSettingsScreen(
                                 Icon(Icons.Rounded.UploadFile, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(Modifier.width(6.dp))
                                 Text("选择自定义等宽字体 (.ttf/.otf)")
+                            }
+                            OutlinedButton(onClick = onPickTerminalFontChooser) {
+                                Text("其他方式")
                             }
                             val customPath = prefs.terminalCustomFontPath
                             if (customPath != null) {
