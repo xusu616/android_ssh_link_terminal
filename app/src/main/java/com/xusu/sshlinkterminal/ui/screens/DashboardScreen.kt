@@ -93,6 +93,8 @@ import com.xusu.sshlinkterminal.data.SessionState
 import com.xusu.sshlinkterminal.data.SshKeyRecord
 import com.xusu.sshlinkterminal.data.UiPreferences
 import com.xusu.sshlinkterminal.ssh.SessionUiSnapshot
+import com.xusu.sshlinkterminal.ssh.KnownHostKey
+import com.xusu.sshlinkterminal.ssh.KnownHostKeyStore
 import com.xusu.sshlinkterminal.ui.chart.SshLatencyChart
 import com.xusu.sshlinkterminal.ui.glass.GuardianControlButton
 import com.xusu.sshlinkterminal.ui.glass.NarrowGlassRail
@@ -129,6 +131,8 @@ fun DashboardScreen(
     onToggleGuardianAll: () -> Unit,
     onSaveHost: (HostProfile) -> Unit,
     onDeleteHost: (String) -> Unit,
+    onReadHostKey: (String, Int) -> Result<KnownHostKey?>,
+    onForgetHostKey: (String, Int) -> Result<Unit>,
     modifier: Modifier = Modifier
 ) {
     val hazeState = rememberHazeState()
@@ -452,6 +456,8 @@ fun DashboardScreen(
         HostEditorDialog(
             initial = editingHost,
             keys = keys,
+            onReadHostKey = onReadHostKey,
+            onForgetHostKey = onForgetHostKey,
             onDismiss = {
                 showCreateHost = false
                 editingHost = null
@@ -651,6 +657,8 @@ private fun HostProfileCard(
 fun HostEditorDialog(
     initial: HostProfile?,
     keys: List<SshKeyRecord>,
+    onReadHostKey: (String, Int) -> Result<KnownHostKey?>,
+    onForgetHostKey: (String, Int) -> Result<Unit>,
     onDismiss: () -> Unit,
     onSave: (HostProfile) -> Unit
 ) {
@@ -667,6 +675,14 @@ fun HostEditorDialog(
     var pinInDaemon by remember { mutableStateOf(initial?.pinInDaemon ?: true) }
     var tag by remember { mutableStateOf(initial?.tag ?: "LAN") }
     var keyMenuExpanded by remember { mutableStateOf(false) }
+    var hostKeyRevision by remember { mutableStateOf(0) }
+    var forgettingHostKey by remember { mutableStateOf<Pair<String, Int>?>(null) }
+    var hostKeyActionError by remember(host, portText) { mutableStateOf<String?>(null) }
+    val enteredPort = portText.toIntOrNull()
+    val validEndpoint = host.isNotBlank() && enteredPort != null && enteredPort in 1..65535
+    val savedHostKey = remember(host, portText, hostKeyRevision) {
+        if (validEndpoint) onReadHostKey(host, enteredPort) else Result.success(null)
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -709,6 +725,25 @@ fun HostEditorDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                Text("服务器身份", style = MaterialTheme.typography.labelMedium)
+                val knownKey = savedHostKey.getOrNull()
+                Text(
+                    text = when {
+                        savedHostKey.isFailure -> savedHostKey.exceptionOrNull()?.message.orEmpty()
+                        knownKey != null -> "${knownKey.algorithm}\n${knownKey.fingerprintSha256}"
+                        else -> "此地址尚未保存主机指纹，首次连接时需要确认"
+                    },
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if ((knownKey != null || savedHostKey.isFailure) && validEndpoint) {
+                    TextButton(
+                        onClick = { forgettingHostKey = host.trim() to enteredPort }
+                    ) { Text("清除旧指纹并重新核对") }
+                }
+                hostKeyActionError?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
 
                 Text("标签", style = MaterialTheme.typography.labelMedium)
                 Row(
@@ -866,6 +901,32 @@ fun HostEditorDialog(
             TextButton(onClick = onDismiss) { Text("取消") }
         }
     )
+
+    forgettingHostKey?.let { (targetHost, targetPort) ->
+        AlertDialog(
+            onDismissRequest = { forgettingHostKey = null },
+            title = { Text("清除已保存的主机指纹？") },
+            text = {
+                Text(
+                    "地址：${KnownHostKeyStore.endpoint(targetHost, targetPort)}\n\n" +
+                        "该地址的会话会断开，下次连接需要重新确认指纹。" +
+                        "请先通过可信渠道核对服务器是否确实更换了密钥。"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onForgetHostKey(targetHost, targetPort).fold(
+                        onSuccess = { hostKeyRevision++; hostKeyActionError = null },
+                        onFailure = { hostKeyActionError = it.message }
+                    )
+                    forgettingHostKey = null
+                }) { Text("清除并重新核对") }
+            },
+            dismissButton = {
+                TextButton(onClick = { forgettingHostKey = null }) { Text("取消") }
+            }
+        )
+    }
 }
 
 @Composable

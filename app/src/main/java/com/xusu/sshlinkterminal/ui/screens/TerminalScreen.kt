@@ -211,7 +211,7 @@ fun TerminalScreen(
     onResizePty: (String, Int, Int) -> Unit,
     onClearTerminal: (String) -> Unit,
     onDismissAuthLink: (String) -> Unit,
-    onSubmitInteractivePrompt: (String, List<String>?) -> Unit,
+    onSubmitInteractivePrompt: (String, String, List<String>?) -> Unit,
     onDeployPublicKey: (String, String) -> Unit,
     onFontScaleChange: (Float) -> Unit,
     onOpenMacroEditor: () -> Unit,
@@ -1644,7 +1644,7 @@ fun TerminalScreen(
             }
         }
         AlertDialog(
-            onDismissRequest = { onSubmitInteractivePrompt(promptTargetKey, null) },
+            onDismissRequest = { onSubmitInteractivePrompt(promptTargetKey, pendingPrompt.requestId, null) },
             title = { Text(pendingPrompt.title) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1668,12 +1668,14 @@ fun TerminalScreen(
                 }
             },
             confirmButton = {
-                TextButton(onClick = { onSubmitInteractivePrompt(promptTargetKey, answers.toList()) }) {
-                    Text("提交")
+                TextButton(onClick = {
+                    onSubmitInteractivePrompt(promptTargetKey, pendingPrompt.requestId, answers.toList())
+                }) {
+                    Text(pendingPrompt.confirmButtonText)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { onSubmitInteractivePrompt(promptTargetKey, null) }) {
+                TextButton(onClick = { onSubmitInteractivePrompt(promptTargetKey, pendingPrompt.requestId, null) }) {
                     Text("取消")
                 }
             }

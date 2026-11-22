@@ -2,6 +2,7 @@ package com.xusu.sshlinkterminal.data
 
 import android.content.Context
 import androidx.core.content.edit
+import com.xusu.sshlinkterminal.ssh.KnownHostKeyStore
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -12,6 +13,16 @@ import org.json.JSONObject
 class AppRepository(context: Context) {
 
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    val knownHostKeys = KnownHostKeyStore(
+        readEntry = { endpoint -> prefs.getString("known_host_key:$endpoint", null) },
+        writeEntry = { endpoint, value ->
+            val editor = prefs.edit()
+            if (value == null) editor.remove("known_host_key:$endpoint")
+            else editor.putString("known_host_key:$endpoint", value)
+            editor.commit()
+        }
+    )
 
     private val _hosts = MutableStateFlow(loadHosts())
     val hosts: StateFlow<List<HostProfile>> = _hosts.asStateFlow()

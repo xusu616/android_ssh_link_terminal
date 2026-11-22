@@ -138,7 +138,8 @@ data class InteractivePromptRequest(
     val title: String,
     val instruction: String,
     val prompts: List<String>,
-    val echo: List<Boolean>
+    val echo: List<Boolean>,
+    val confirmButtonText: String = "提交"
 )
 
 data class GuardStatus(

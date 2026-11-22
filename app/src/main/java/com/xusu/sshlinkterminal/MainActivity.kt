@@ -408,6 +408,8 @@ class MainActivity : ComponentActivity() {
                                             app.sshManager.removeHostController(hostId)
                                             app.repository.deleteHost(hostId)
                                         },
+                                        onReadHostKey = { host, port -> runCatching { app.repository.knownHostKeys.read(host, port) } },
+                                        onForgetHostKey = { host, port -> runCatching { app.sshManager.forgetHostKey(host, port) } },
                                         modifier = Modifier.padding(start = (startPadding - NarrowRailWidth).coerceAtLeast(0.dp))
                                     )
                                 },
@@ -515,8 +517,8 @@ class MainActivity : ComponentActivity() {
                                 onDismissAuthLink = { sessionKey ->
                                     app.sshManager.getControllerBySessionId(sessionKey)?.dismissAuthLink()
                                 },
-                                onSubmitInteractivePrompt = { sessionKey, answers ->
-                                    app.sshManager.getControllerBySessionId(sessionKey)?.submitInteractivePrompt(answers)
+                                onSubmitInteractivePrompt = { sessionKey, requestId, answers ->
+                                    app.sshManager.getControllerBySessionId(sessionKey)?.submitInteractivePrompt(requestId, answers)
                                 },
                                 onDeployPublicKey = { sessionKey, pubKey ->
                                     app.sshManager.getControllerBySessionId(sessionKey)?.deployKey(pubKey) { _, msg ->

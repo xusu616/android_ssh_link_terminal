@@ -32,6 +32,14 @@ class SshSessionManagerPolicyTest {
     }
 
     @Test
+    fun `host identity rejection stops automatic reconnect in every state`() {
+        SessionState.entries.forEach { state ->
+            assertFalse(SshSessionManager.shouldReconnectOnAction(state, pinInDaemon = true, hostKeyReviewRequired = true))
+            assertFalse(SshSessionManager.shouldReconnectOnAction(state, pinInDaemon = false, hostKeyReviewRequired = true))
+        }
+    }
+
+    @Test
     fun `resolveHostSelection preserves active session host instead of resetting to first host`() {
         val hosts = listOf(host("h1"), host("h2"), host("h3"))
 

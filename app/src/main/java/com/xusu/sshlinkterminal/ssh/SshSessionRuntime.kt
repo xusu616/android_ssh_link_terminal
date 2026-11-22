@@ -121,6 +121,12 @@ class SshSessionController(
     private var userInitiatedStop = false
 
     @Volatile
+    private var hostIdentityBlocked = false
+
+    internal val hostKeyReviewRequired: Boolean
+        get() = hostIdentityBlocked
+
+    @Volatile
     private var lastAutoOpenedUrl: String? = null
 
     @Volatile
@@ -135,6 +141,7 @@ class SshSessionController(
     @Volatile
     private var reviveNoticeShown = false
 
+    private val promptLock = Any()
     private var pendingPromptDeferred: CompletableDeferred<List<String>?>? = null
     private val authRollingBuffer = StringBuilder()
 
@@ -156,10 +163,11 @@ class SshSessionController(
     }
 
     private fun cancelPendingPrompt() {
-        val deferred = pendingPromptDeferred
-        pendingPromptDeferred = null
-        deferred?.cancel()
-        _snapshot.update { it.copy(pendingInteractivePrompt = null) }
+        synchronized(promptLock) {
+            pendingPromptDeferred?.cancel()
+            pendingPromptDeferred = null
+            _snapshot.update { it.copy(pendingInteractivePrompt = null) }
+        }
     }
 
     private fun isAttemptActive(gen: Long, coroutineActive: Boolean): Boolean =
@@ -173,6 +181,7 @@ class SshSessionController(
         TerminalForegroundService.ensureStarted(context)
         val gen = connectionGen.incrementAndGet()
         userInitiatedStop = false
+        hostIdentityBlocked = false
         cancelPendingPrompt()
         val previousConnection = connectionJob
         val previousKeepAlive = keepAliveJob
@@ -224,7 +233,7 @@ class SshSessionController(
 
     fun onNetworkAvailable() {
         val state = _snapshot.value.state
-        if (!userInitiatedStop && hostProfile.autoReconnect &&
+        if (!userInitiatedStop && !hostIdentityBlocked && hostProfile.autoReconnect &&
             (state == SessionState.RECONNECTING || state == SessionState.ERROR || state == SessionState.DISCONNECTED)
         ) {
             repository.appendLog("INFO", "SSH", "${hostProfile.name}: 检测到网络恢复，立即尝试重连")
@@ -294,10 +303,18 @@ class SshSessionController(
     }
 
     fun submitInteractivePrompt(answers: List<String>?) {
-        val deferred = pendingPromptDeferred
-        pendingPromptDeferred = null
-        _snapshot.update { it.copy(pendingInteractivePrompt = null) }
-        deferred?.complete(answers)
+        val requestId = _snapshot.value.pendingInteractivePrompt?.requestId ?: return
+        submitInteractivePrompt(requestId, answers)
+    }
+
+    fun submitInteractivePrompt(requestId: String, answers: List<String>?) {
+        synchronized(promptLock) {
+            if (_snapshot.value.pendingInteractivePrompt?.requestId != requestId) return
+            val deferred = pendingPromptDeferred
+            pendingPromptDeferred = null
+            _snapshot.update { it.copy(pendingInteractivePrompt = null) }
+            deferred?.complete(answers)
+        }
     }
 
     fun deployKey(publicKeyLine: String, onResult: (Boolean, String) -> Unit) {
@@ -335,6 +352,7 @@ class SshSessionController(
                 }
             } catch (e: Exception) {
                 if (isAttemptActive(gen, currentCoroutineContext().isActive)) {
+                    if (e is HostKeyVerificationException) hostIdentityBlocked = true
                     emulator.exitAltScreenIfActive()
                     unexpectedFailureMessage = e.message ?: e::class.java.simpleName
                     repository.appendLog("WARN", "SSH", "$label: 连接中断 - $unexpectedFailureMessage")
@@ -346,7 +364,9 @@ class SshSessionController(
                 }
             }
 
-            if (!isAttemptActive(gen, currentCoroutineContext().isActive) || !currentHost.autoReconnect) {
+            if (!isAttemptActive(gen, currentCoroutineContext().isActive) ||
+                !currentHost.autoReconnect || hostIdentityBlocked
+            ) {
                 if (!userInitiatedStop && connectionGen.get() == gen && currentCoroutineContext().isActive) {
                     _snapshot.update {
                         it.copy(
@@ -386,15 +406,30 @@ class SshSessionController(
         emulator.resetParserState()
         val jsch = JSch()
         configureIdentities(jsch, host)
+        val attemptJob = currentCoroutineContext()[Job]!!
+        jsch.hostKeyRepository = PinnedHostKeyRepository(repository.knownHostKeys, host.host, host.port) { key ->
+            awaitUserAnswers(
+                title = "首次连接：确认主机指纹",
+                instruction = "主机：${key.endpoint}\n算法：${key.algorithm}\n" +
+                    "指纹：${key.fingerprintSha256}\n\n" +
+                    "请通过可信渠道与服务器指纹核对。确认后保存指纹；后续密钥变化将阻止连接。",
+                prompts = emptyList(),
+                echo = emptyList(),
+                gen = gen,
+                attemptJob = attemptJob,
+                confirmButtonText = "信任并连接"
+            ) != null
+        }
 
         val session = jsch.getSession(host.username, host.host, host.port)
+        session.hostKeyAlias = KnownHostKeyStore.endpoint(host.host, host.port)
         val rttFactory = RttSocketFactory()
         session.setSocketFactory(rttFactory)
         var channel: ChannelShell? = null
         var outStream: OutputStream? = null
         try {
             jschSession = session
-            session.setConfig("StrictHostKeyChecking", "no")
+            session.setConfig("StrictHostKeyChecking", "yes")
             session.setConfig(
                 "PreferredAuthentications",
                 when (host.authType) {
@@ -417,7 +452,7 @@ class SshSessionController(
             session.setServerAliveInterval(serverAliveMs)
             session.setServerAliveCountMax(20)
 
-            session.userInfo = createSshUserInfo(host, savedPassword)
+            session.userInfo = createSshUserInfo(host, savedPassword, gen, attemptJob)
 
             // Tailscale Check Mode / interactive SSO may take up to ~2 minutes while user authorizes in browser
             session.connect(90_000)
@@ -550,7 +585,7 @@ class SshSessionController(
         )
     }
 
-    private fun createSshUserInfo(host: HostProfile, savedPassword: String): UserInfo {
+    private fun createSshUserInfo(host: HostProfile, savedPassword: String, gen: Long, attemptJob: Job): UserInfo {
         var usedSavedPassword = false
         return object : UserInfo, UIKeyboardInteractive {
             override fun getPassphrase(): String = VaultCrypto.decrypt(host.encryptedPassphrase)
@@ -565,7 +600,9 @@ class SshSessionController(
                     title = "需要密码 (${host.host})",
                     instruction = message ?: "请输入 SSH 登录密码",
                     prompts = listOf("Password:"),
-                    echo = listOf(false)
+                    echo = listOf(false),
+                    gen = gen,
+                    attemptJob = attemptJob
                 ) ?: return false
                 jschSession?.setPassword(answer.firstOrNull().orEmpty().toByteArray(StandardCharsets.UTF_8))
                 return true
@@ -578,17 +615,23 @@ class SshSessionController(
                     title = "私钥口令 (${host.host})",
                     instruction = message ?: "请输入私钥 Passphrase",
                     prompts = listOf("Passphrase:"),
-                    echo = listOf(false)
+                    echo = listOf(false),
+                    gen = gen,
+                    attemptJob = attemptJob
                 ) ?: return false
                 return answer.isNotEmpty()
             }
 
             override fun promptYesNo(message: String?): Boolean {
-                if (!message.isNullOrBlank()) {
-                    appendSystemLine("\r\n\u001B[36m$message\u001B[0m\r\n")
-                    scanTextForAuthUrls(message)
-                }
-                return true
+                return awaitUserAnswers(
+                    title = "SSH 连接确认 (${host.host})",
+                    instruction = message.orEmpty(),
+                    prompts = emptyList(),
+                    echo = emptyList(),
+                    gen = gen,
+                    attemptJob = attemptJob,
+                    confirmButtonText = "确认"
+                ) != null
             }
 
             override fun showMessage(message: String?) {
@@ -631,7 +674,9 @@ class SshSessionController(
                     title = name?.ifBlank { null } ?: "交互式认证 (${host.host})",
                     instruction = instruction.orEmpty(),
                     prompts = promptsList,
-                    echo = echoList
+                    echo = echoList,
+                    gen = gen,
+                    attemptJob = attemptJob
                 )
                 return answers?.toTypedArray()
             }
@@ -642,26 +687,46 @@ class SshSessionController(
         title: String,
         instruction: String,
         prompts: List<String>,
-        echo: List<Boolean>
+        echo: List<Boolean>,
+        gen: Long,
+        attemptJob: Job,
+        confirmButtonText: String = "提交"
     ): List<String>? {
-        val deferred = CompletableDeferred<List<String>?>()
-        pendingPromptDeferred = deferred
-        _snapshot.update {
-            it.copy(
-                state = SessionState.AWAITING_INPUT,
-                statusDetail = "等待输入认证信息",
-                pendingInteractivePrompt = InteractivePromptRequest(
-                    title = title,
-                    instruction = instruction,
-                    prompts = prompts,
-                    echo = echo
-                )
-            )
-        }
-        return runBlocking {
-            withTimeoutOrNull(120_000L) {
-                deferred.await()
+        val deferred = CompletableDeferred<List<String>?>(attemptJob)
+        val request = InteractivePromptRequest(
+            title = title,
+            instruction = instruction,
+            prompts = prompts,
+            echo = echo,
+            confirmButtonText = confirmButtonText
+        )
+        synchronized(promptLock) {
+            if (!isAttemptActive(gen, attemptJob.isActive)) {
+                deferred.cancel()
+                return null
             }
+            pendingPromptDeferred = deferred
+            _snapshot.update {
+                it.copy(
+                    state = SessionState.AWAITING_INPUT,
+                    statusDetail = if (prompts.isEmpty()) "等待确认连接" else "等待输入认证信息",
+                    pendingInteractivePrompt = request
+                )
+            }
+        }
+        try {
+            val answers = runBlocking {
+                withTimeoutOrNull(120_000L) { deferred.await() }
+            }
+            return if (isAttemptActive(gen, attemptJob.isActive)) answers else null
+        } finally {
+            synchronized(promptLock) {
+                if (_snapshot.value.pendingInteractivePrompt?.requestId == request.requestId) {
+                    pendingPromptDeferred = null
+                    _snapshot.update { it.copy(pendingInteractivePrompt = null) }
+                }
+            }
+            deferred.cancel()
         }
     }
 
@@ -939,6 +1004,17 @@ class SshSessionManager(
         list.forEach { it.disconnect() }
     }
 
+    fun forgetHostKey(host: String, port: Int) {
+        val endpoint = KnownHostKeyStore.endpoint(host, port)
+        val list = synchronized(managerLock) {
+            controllers.values.filter {
+                KnownHostKeyStore.endpoint(it.hostProfile.host, it.hostProfile.port) == endpoint
+            }
+        }
+        list.forEach { it.disconnect() }
+        repository.knownHostKeys.forget(host, port)
+    }
+
     fun disconnectAll() {
         val list = synchronized(managerLock) { controllers.values.toList() }
         list.forEach { it.disconnect() }
@@ -948,7 +1024,7 @@ class SshSessionManager(
         val list = synchronized(managerLock) { controllers.values.toList() }
         list.forEach { controller ->
             val state = controller.snapshot.value.state
-            if (shouldReconnectOnAction(state, controller.hostProfile.pinInDaemon)) {
+            if (shouldReconnectOnAction(state, controller.hostProfile.pinInDaemon, controller.hostKeyReviewRequired)) {
                 controller.connect(forceRestart = state == SessionState.RECONNECTING)
             }
         }
@@ -964,7 +1040,7 @@ class SshSessionManager(
                 if (shouldNotifyRevive) {
                     controller.appendNoticeOnce("\r\n\u001B[33m$reviveReason\u001B[0m\r\n")
                 }
-                controller.connect()
+                if (!controller.hostKeyReviewRequired) controller.connect()
             }
     }
 
@@ -1011,7 +1087,11 @@ class SshSessionManager(
     }
 
     companion object {
-        internal fun shouldReconnectOnAction(state: SessionState, pinInDaemon: Boolean): Boolean = when (state) {
+        internal fun shouldReconnectOnAction(
+            state: SessionState,
+            pinInDaemon: Boolean,
+            hostKeyReviewRequired: Boolean = false
+        ): Boolean = !hostKeyReviewRequired && when (state) {
             SessionState.CONNECTED,
             SessionState.CONNECTING,
             SessionState.AWAITING_INPUT,
