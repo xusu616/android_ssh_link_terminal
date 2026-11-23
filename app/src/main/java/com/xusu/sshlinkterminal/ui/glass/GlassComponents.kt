@@ -21,6 +21,7 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -29,6 +30,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -39,7 +41,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
@@ -50,7 +51,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.BlurOn
 import androidx.compose.material.icons.rounded.Menu
-import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.WarningAmber
@@ -63,7 +63,9 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedIconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Stable
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -71,34 +73,32 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.translate
-import androidx.compose.ui.graphics.layer.GraphicsLayer
-import androidx.compose.ui.graphics.layer.drawLayer
-import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xusu.sshlinkterminal.data.ChartWindowRule
 import com.xusu.sshlinkterminal.data.ColorBag
+import com.xusu.sshlinkterminal.ui.theme.contrastOnColor
+import com.xusu.sshlinkterminal.ui.theme.topSafeInsetsPadding
 import dev.chrisbanes.haze.HazeInputScale
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.blur.HazeColorEffect
 import dev.chrisbanes.haze.blur.blurEffect
 import dev.chrisbanes.haze.hazeEffect
+import dev.chrisbanes.haze.hazeSource
+import dev.chrisbanes.haze.rememberHazeState
 
 internal val GlassSideMenuWidth = 276.dp
 internal val NarrowRailWidth = 68.dp
@@ -107,44 +107,6 @@ fun <T> bouncySpringSpec(): SpringSpec<T> = spring(
     dampingRatio = Spring.DampingRatioMediumBouncy,
     stiffness = Spring.StiffnessLow
 )
-
-@Stable
-class GlassBackdrop(val layer: GraphicsLayer) {
-    var positionInRoot by mutableStateOf(Offset.Zero)
-}
-
-@Composable
-fun rememberGlassBackdrop(): GlassBackdrop {
-    val layer = rememberGraphicsLayer()
-    return remember(layer) { GlassBackdrop(layer) }
-}
-
-@Composable
-fun CaptureGlassBackdrop(
-    backdrop: GlassBackdrop,
-    hazeState: HazeState,
-    blurIntensity: Float
-) {
-    Box(
-        Modifier
-            .fillMaxSize()
-            .onGloballyPositioned { backdrop.positionInRoot = it.positionInRoot() }
-            .drawWithContent {
-                backdrop.layer.record { this@drawWithContent.drawContent() }
-            }
-            .glassHaze(hazeState = hazeState, blurIntensity = blurIntensity)
-    )
-}
-
-@Composable
-fun Modifier.glassBackdrop(backdrop: GlassBackdrop): Modifier {
-    var positionInRoot by remember { mutableStateOf(Offset.Zero) }
-    return onGloballyPositioned { positionInRoot = it.positionInRoot() }
-        .drawBehind {
-            val offset = backdrop.positionInRoot - positionInRoot
-            translate(offset.x, offset.y) { drawLayer(backdrop.layer) }
-        }
-}
 
 @Composable
 fun Modifier.glassHaze(
@@ -204,7 +166,7 @@ fun rememberSideMenuState(): SideMenuState = remember { SideMenuState() }
 fun ResponsiveSideMenuLayout(
     state: SideMenuState,
     railPadding: Dp,
-    backdrop: GlassBackdrop,
+    blurRadius: Float,
     colorBag: ColorBag,
     springAnimation: Boolean,
     showWallpaper: Boolean,
@@ -214,6 +176,7 @@ fun ResponsiveSideMenuLayout(
     mainContent: @Composable (startPadding: Dp) -> Unit,
     detailContent: @Composable (route: String, expanded: Boolean, onBack: () -> Unit) -> Unit
 ) {
+    val drawerHazeState = rememberHazeState()
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val expanded = maxWidth >= 600.dp
         val mainStartPadding by animateDpAsState(
@@ -223,7 +186,13 @@ fun ResponsiveSideMenuLayout(
             } else tween(280),
             label = "sideMenuStartPadding"
         )
-        mainContent(mainStartPadding)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .hazeSource(drawerHazeState)
+        ) {
+            mainContent(mainStartPadding)
+        }
 
         AnimatedVisibility(
             visible = state.isOpen,
@@ -254,7 +223,8 @@ fun ResponsiveSideMenuLayout(
             )
         ) {
             GlassSidebarBox(
-                backdrop = backdrop,
+                hazeState = drawerHazeState,
+                blurRadius = blurRadius,
                 showWallpaper = showWallpaper,
                 onDismiss = state::close
             ) {
@@ -311,37 +281,67 @@ data class SideMenuItem(
     val icon: ImageVector
 )
 
+internal val LocalGlassSidebarLightMask = compositionLocalOf { false }
+
+internal fun glassSidebarPrimaryText(lightMask: Boolean): Color =
+    if (lightMask) Color(0xFF0F172A) else Color.White
+
+internal fun glassSidebarSecondaryText(lightMask: Boolean): Color =
+    if (lightMask) Color(0xFF334155) else Color.White.copy(alpha = 0.74f)
+
 @Composable
 fun GlassSidebarBox(
-    backdrop: GlassBackdrop,
+    hazeState: HazeState,
+    blurRadius: Float,
     showWallpaper: Boolean,
-    onDismiss: () -> Unit,
+    onDismiss: () -> Unit = {},
     content: @Composable ColumnScope.() -> Unit
 ) {
+    val isLightMask = showWallpaper && !isSystemInDarkTheme()
+    val shape = RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp)
     Box(
         modifier = Modifier
             .width(GlassSideMenuWidth)
             .fillMaxHeight()
-            .clip(RoundedCornerShape(topEnd = 24.dp, bottomEnd = 24.dp))
+            .clip(shape)
             .then(
-                if (showWallpaper) Modifier.glassBackdrop(backdrop)
-                else Modifier.background(MaterialTheme.colorScheme.surface)
+                if (showWallpaper) {
+                    Modifier.glassHaze(
+                        hazeState = hazeState,
+                        blurIntensity = blurRadius.coerceAtLeast(22f),
+                        darkTint = Color(0xFF0A101E).copy(alpha = 0.74f),
+                        darkFallback = Color(0xFF0B1120).copy(alpha = 0.94f)
+                    )
+                } else {
+                    Modifier.background(MaterialTheme.colorScheme.surface.copy(alpha = 0.96f))
+                }
             )
+            .border(
+                width = 1.dp,
+                brush = Brush.verticalGradient(
+                    0f to if (isLightMask) Color(0xFF0F172A).copy(alpha = 0.14f) else Color.White.copy(alpha = 0.18f),
+                    1f to if (isLightMask) Color(0xFF0F172A).copy(alpha = 0.06f) else Color.White.copy(alpha = 0.06f)
+                ),
+                shape = shape
+            )
+            // Option rows consume their own clicks; tapping blank/header areas dismisses the drawer.
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
                 onClick = onDismiss
             )
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .statusBarsPadding()
-                .navigationBarsPadding()
-                .padding(bottom = 24.dp),
-            content = content
-        )
+        CompositionLocalProvider(LocalGlassSidebarLightMask provides isLightMask) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .topSafeInsetsPadding()
+                    .navigationBarsPadding()
+                    .padding(bottom = 24.dp),
+                content = content
+            )
+        }
     }
 }
 
@@ -354,6 +354,9 @@ fun SideMenuRow(
     selected: Boolean,
     onClick: () -> Unit
 ) {
+    val lightMask = LocalGlassSidebarLightMask.current
+    val iconBg = if (colorBag.useM3Color) MaterialTheme.colorScheme.primary else colorBag.vibrant
+    val iconFg = if (colorBag.useM3Color) MaterialTheme.colorScheme.onPrimary else contrastOnColor(iconBg)
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
@@ -373,13 +376,13 @@ fun SideMenuRow(
             modifier = Modifier
                 .size(40.dp)
                 .clip(CircleShape)
-                .background(if (colorBag.useM3Color) MaterialTheme.colorScheme.primary else colorBag.vibrant),
+                .background(iconBg),
             contentAlignment = Alignment.Center
         ) {
             Icon(
                 imageVector = icon,
                 contentDescription = null,
-                tint = if (colorBag.useM3Color) MaterialTheme.colorScheme.onPrimary else colorBag.darkMuted,
+                tint = iconFg,
                 modifier = Modifier.size(22.dp)
             )
         }
@@ -389,12 +392,12 @@ fun SideMenuRow(
                 text = title,
                 style = MaterialTheme.typography.bodyLarge,
                 fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurface
+                color = glassSidebarPrimaryText(lightMask)
             )
             Text(
                 text = subtitle,
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                color = glassSidebarSecondaryText(lightMask)
             )
         }
     }
@@ -490,11 +493,12 @@ fun GuardianControlButton(
     isRunning: Boolean,
     activeLabel: String,
     inactiveLabel: String,
+    accentColor: Color = Color(0xFF5EEAD4),
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val buttonColor by animateColorAsState(
-        targetValue = if (isRunning) Color(0xFFE57373) else Color(0xFF5EEAD4),
+        targetValue = if (isRunning) Color(0xFFF87171) else accentColor,
         animationSpec = bouncySpringSpec(),
         label = "guardianBtnColor"
     )
@@ -503,15 +507,19 @@ fun GuardianControlButton(
         modifier = modifier.height(46.dp),
         shape = RoundedCornerShape(16.dp),
         border = BorderStroke(2.dp, buttonColor),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
         colors = ButtonDefaults.outlinedButtonColors(
-            containerColor = buttonColor.copy(alpha = 0.10f),
+            containerColor = buttonColor.copy(alpha = 0.12f),
             contentColor = buttonColor
         )
     ) {
         Text(
             text = if (isRunning) activeLabel else inactiveLabel,
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold
+            style = MaterialTheme.typography.labelLarge.copy(fontSize = 14.sp),
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            softWrap = false,
+            overflow = TextOverflow.Ellipsis
         )
     }
 }
@@ -539,6 +547,7 @@ fun ThreeStateWindowSwitch(
         label = "windowPillOffset"
     )
     val trackColor = if (colorBag.useM3Color) MaterialTheme.colorScheme.secondaryContainer else colorBag.vibrant
+    val inactiveLabelColor = contrastOnColor(trackColor).copy(alpha = 0.72f)
     val textStyle = TextStyle(
         fontSize = 9.sp,
         fontWeight = FontWeight.Bold,
@@ -566,7 +575,7 @@ fun ThreeStateWindowSwitch(
                         },
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(label, color = Color.DarkGray.copy(alpha = 0.72f), style = textStyle)
+                    Text(label, color = inactiveLabelColor, style = textStyle)
                 }
             }
         }
@@ -578,7 +587,7 @@ fun ThreeStateWindowSwitch(
                 .background(Color.White, CircleShape),
             contentAlignment = Alignment.Center
         ) {
-            Text(options[selectedIndex].second, color = Color.DarkGray, style = textStyle)
+            Text(options[selectedIndex].second, color = Color(0xFF0F172A), style = textStyle)
         }
     }
 }
@@ -595,11 +604,10 @@ fun NarrowGlassRail(
     onToggleGlass: () -> Unit,
     onOpenTerminal: () -> Unit,
     onOpenGuardCard: () -> Unit,
-    onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val btnBg = if (colorBag.useM3Color) MaterialTheme.colorScheme.secondaryContainer else colorBag.vibrant
-    val btnFg = if (colorBag.useM3Color) MaterialTheme.colorScheme.onSecondaryContainer else colorBag.darkMuted
+    val btnFg = if (colorBag.useM3Color) MaterialTheme.colorScheme.onSecondaryContainer else contrastOnColor(btnBg)
     val rotation by animateFloatAsState(
         targetValue = if (glassEnabled) 180f else 0f,
         animationSpec = bouncySpringSpec(),
@@ -610,7 +618,7 @@ fun NarrowGlassRail(
         modifier = modifier
             .width(NarrowRailWidth)
             .fillMaxHeight()
-            .statusBarsPadding()
+            .topSafeInsetsPadding()
             .navigationBarsPadding()
             .padding(vertical = 12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -652,14 +660,6 @@ fun NarrowGlassRail(
                     contentDescription = "切换玻璃背景",
                     modifier = Modifier.rotate(rotation)
                 )
-            }
-
-            FilledTonalIconButton(
-                onClick = onOpenSettings,
-                modifier = Modifier.size(48.dp),
-                colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = btnBg, contentColor = btnFg)
-            ) {
-                Icon(Icons.Rounded.Settings, contentDescription = "外观设置")
             }
 
             OutlinedIconButton(

@@ -1,5 +1,6 @@
 package com.xusu.sshlinkterminal.ui.screens
 
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.BorderStroke
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -71,8 +73,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -86,22 +90,27 @@ import com.xusu.sshlinkterminal.data.ChartWindowRule
 import com.xusu.sshlinkterminal.data.ColorBag
 import com.xusu.sshlinkterminal.data.GuardStatus
 import com.xusu.sshlinkterminal.data.HostProfile
+import com.xusu.sshlinkterminal.ssh.LocalPortForward
 import com.xusu.sshlinkterminal.data.RttSample
 import com.xusu.sshlinkterminal.data.SessionState
 import com.xusu.sshlinkterminal.data.SshKeyRecord
 import com.xusu.sshlinkterminal.data.UiPreferences
 import com.xusu.sshlinkterminal.ssh.SessionUiSnapshot
+import com.xusu.sshlinkterminal.ssh.KnownHostKey
+import com.xusu.sshlinkterminal.ssh.KnownHostKeyStore
 import com.xusu.sshlinkterminal.ui.chart.SshLatencyChart
 import com.xusu.sshlinkterminal.ui.glass.GuardianControlButton
 import com.xusu.sshlinkterminal.ui.glass.NarrowGlassRail
 import com.xusu.sshlinkterminal.ui.glass.NarrowRailWidth
 import com.xusu.sshlinkterminal.ui.glass.ThreeStateWindowSwitch
 import com.xusu.sshlinkterminal.ui.glass.glassHaze
+import com.xusu.sshlinkterminal.ui.theme.contrastOnColor
 import com.xusu.sshlinkterminal.ui.theme.getDeviceCornerRadius
 import com.xusu.sshlinkterminal.ui.theme.getDisplayCutoutTopPadding
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
+import java.util.Locale
 
 @Composable
 fun DashboardScreen(
@@ -120,13 +129,13 @@ fun DashboardScreen(
     onToggleGlass: () -> Unit,
     onOpenWallpaperPicker: () -> Unit,
     onOpenGuardCard: () -> Unit,
-    onOpenSettings: () -> Unit,
     onOpenTerminalScreen: (String?) -> Unit,
-    onConnectHost: (HostProfile) -> Unit,
     onDisconnectHost: (String) -> Unit,
     onToggleGuardianAll: () -> Unit,
     onSaveHost: (HostProfile) -> Unit,
     onDeleteHost: (String) -> Unit,
+    onReadHostKey: (String, Int) -> Result<KnownHostKey?>,
+    onForgetHostKey: (String, Int) -> Result<Unit>,
     modifier: Modifier = Modifier
 ) {
     val hazeState = rememberHazeState()
@@ -137,12 +146,24 @@ fun DashboardScreen(
     val activeSessionsCount = sessions.values.count {
         it.state == SessionState.CONNECTED || it.state == SessionState.AWAITING_OAUTH
     }
+    val hasRunningConnections = sessions.values.any {
+        it.state == SessionState.CONNECTED ||
+            it.state == SessionState.CONNECTING ||
+            it.state == SessionState.RECONNECTING ||
+            it.state == SessionState.AWAITING_OAUTH ||
+            it.state == SessionState.AWAITING_INPUT
+    }
     val guardHealthy = guardStatus.notificationsGranted &&
         guardStatus.batteryOptimizationIgnored &&
         guardStatus.shizukuPermissionGranted
     val accentColor = if (colorBag.useM3Color) MaterialTheme.colorScheme.primary else colorBag.vibrant
+    val outlineAccent = if (!colorBag.useM3Color && accentColor.luminance() < 0.14f) {
+        colorBag.lightMuted
+    } else {
+        accentColor
+    }
     val secondaryColor = if (colorBag.useM3Color) MaterialTheme.colorScheme.secondary else colorBag.muted
-    val guardianActive = guardStatus.foregroundServiceRunning || activeSessionsCount > 0
+    val guardianActive = guardStatus.foregroundServiceRunning || hasRunningConnections
 
     Box(modifier = modifier.fillMaxSize()) {
         // Full-bleed Wallpaper Background for Glass Effect
@@ -187,8 +208,7 @@ fun DashboardScreen(
                 onToggleMenu = onToggleMenu,
                 onToggleGlass = onToggleGlass,
                 onOpenTerminal = { onOpenTerminalScreen(null) },
-                onOpenGuardCard = onOpenGuardCard,
-                onOpenSettings = onOpenSettings
+                onOpenGuardCard = onOpenGuardCard
             )
 
             BoxWithConstraints(
@@ -251,12 +271,12 @@ fun DashboardScreen(
                                 ) {
                                     Surface(
                                         shape = CircleShape,
-                                        color = (if (guardHealthy) Color(0xFF4ADE80) else accentColor).copy(alpha = 0.20f),
-                                        border = BorderStroke(1.dp, (if (guardHealthy) Color(0xFF4ADE80) else accentColor).copy(alpha = 0.6f))
+                                        color = (if (guardHealthy) Color(0xFF4ADE80) else outlineAccent).copy(alpha = 0.20f),
+                                        border = BorderStroke(1.dp, (if (guardHealthy) Color(0xFF4ADE80) else outlineAccent).copy(alpha = 0.6f))
                                     ) {
                                         Text(
                                             text = if (guardStatus.watchdogActive) "SHIZUKU 守护已武装" else "LINK TERMINAL",
-                                            color = if (guardHealthy) Color(0xFF86EFAC) else accentColor,
+                                            color = if (guardHealthy) Color(0xFF86EFAC) else outlineAccent,
                                             fontSize = 10.sp,
                                             fontWeight = FontWeight.Bold,
                                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
@@ -316,8 +336,17 @@ fun DashboardScreen(
                                         fontWeight = FontWeight.Bold
                                     )
                                     val latestRtt = rttSamples.lastOrNull()?.rttMs
+                                    val avgRtt = if (rttSamples.isNotEmpty()) {
+                                        rttSamples.map { it.rttMs }.average()
+                                    } else {
+                                        null
+                                    }
                                     Text(
-                                        text = if (latestRtt != null) "最近心跳 ${latestRtt}ms · 守护常驻" else "启动守护后实时采集 SSH 心跳",
+                                        text = if (latestRtt != null && avgRtt != null) {
+                                            "实时 ${latestRtt}ms · 均值 ${String.format(Locale.US, "%.1f", avgRtt)}ms"
+                                        } else {
+                                            "开启连接后实时采集 SSH 心跳"
+                                        },
                                         color = Color(0xFF94A3B8),
                                         style = MaterialTheme.typography.labelSmall
                                     )
@@ -332,8 +361,9 @@ fun DashboardScreen(
                             SshLatencyChart(
                                 samples = rttSamples,
                                 windowRule = chartWindow,
-                                accentColor = accentColor,
+                                accentColor = outlineAccent,
                                 secondaryColor = secondaryColor,
+                                animateAxisSwitch = uiPreferences.chartAxisAnimation,
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .height(148.dp)
@@ -346,19 +376,21 @@ fun DashboardScreen(
                             ) {
                                 GuardianControlButton(
                                     isRunning = guardianActive,
-                                    activeLabel = "停止全部守护",
-                                    inactiveLabel = "一键守护并恢复",
+                                    activeLabel = "断开所有连接",
+                                    inactiveLabel = "开启所有连接",
+                                    accentColor = outlineAccent,
                                     onClick = onToggleGuardianAll,
                                     modifier = Modifier.weight(1f)
                                 )
                                 FilledTonalButton(
                                     onClick = { onOpenTerminalScreen(null) },
                                     shape = RoundedCornerShape(16.dp),
+                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
                                     modifier = Modifier.height(46.dp)
                                 ) {
                                     Icon(Icons.Rounded.Terminal, contentDescription = null, modifier = Modifier.size(18.dp))
                                     Spacer(Modifier.width(6.dp))
-                                    Text("终端")
+                                    Text("终端", maxLines = 1, softWrap = false)
                                 }
                             }
                         }
@@ -377,25 +409,30 @@ fun DashboardScreen(
                             fontWeight = FontWeight.Bold
                         )
                         TextButton(onClick = { showCreateHost = true }) {
-                            Icon(Icons.Rounded.Add, contentDescription = null, tint = accentColor, modifier = Modifier.size(18.dp))
+                            Icon(Icons.Rounded.Add, contentDescription = null, tint = outlineAccent, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("新增主机", color = accentColor)
+                            Text("新增主机", color = outlineAccent)
                         }
                     }
 
                     hosts.forEach { host ->
-                        val snap = sessions[host.id]
+                        val hostSessions = sessions.values.filter { it.hostId == host.id }
+                        val snap = hostSessions.firstOrNull {
+                            it.state == SessionState.CONNECTED || it.state == SessionState.AWAITING_OAUTH
+                        } ?: hostSessions.firstOrNull {
+                            it.state == SessionState.CONNECTING ||
+                                it.state == SessionState.RECONNECTING ||
+                                it.state == SessionState.AWAITING_INPUT
+                        } ?: hostSessions.firstOrNull()
                         HostProfileCard(
                             host = host,
                             snapshot = snap,
+                            sessionCount = hostSessions.size,
                             accentColor = accentColor,
                             hazeState = hazeState,
                             blurRadius = uiPreferences.blurRadius,
                             useGlass = uiPreferences.showWallpaper,
-                            onOpenTerminal = {
-                                onConnectHost(host)
-                                onOpenTerminalScreen(host.id)
-                            },
+                            onOpenTerminal = { onOpenTerminalScreen(host.id) },
                             onDisconnect = { onDisconnectHost(host.id) },
                             onEdit = { editingHost = host },
                             onDelete = { onDeleteHost(host.id) }
@@ -408,7 +445,7 @@ fun DashboardScreen(
         FloatingActionButton(
             onClick = { showCreateHost = true },
             containerColor = accentColor,
-            contentColor = colorBag.darkMuted,
+            contentColor = contrastOnColor(accentColor),
             modifier = Modifier
                 .align(Alignment.BottomEnd)
                 .navigationBarsPadding()
@@ -422,6 +459,8 @@ fun DashboardScreen(
         HostEditorDialog(
             initial = editingHost,
             keys = keys,
+            onReadHostKey = onReadHostKey,
+            onForgetHostKey = onForgetHostKey,
             onDismiss = {
                 showCreateHost = false
                 editingHost = null
@@ -469,6 +508,7 @@ private fun FrostedGlassCard(
 private fun HostProfileCard(
     host: HostProfile,
     snapshot: SessionUiSnapshot?,
+    sessionCount: Int = 0,
     accentColor: Color,
     hazeState: HazeState,
     blurRadius: Float,
@@ -524,6 +564,21 @@ private fun HostProfileCard(
                         fontFamily = FontFamily.Monospace,
                         fontSize = 12.sp
                     )
+                }
+                if (sessionCount > 1) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = Color(0xFF1E293B).copy(alpha = 0.85f)
+                    ) {
+                        Text(
+                            text = "$sessionCount 会话",
+                            color = Color(0xFF93C5FD),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(6.dp))
                 }
                 Surface(
                     shape = RoundedCornerShape(10.dp),
@@ -586,11 +641,12 @@ private fun HostProfileCard(
                         FilledTonalButton(
                             onClick = onOpenTerminal,
                             shape = RoundedCornerShape(12.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 2.dp),
                             modifier = Modifier.height(34.dp)
                         ) {
                             Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("连接", fontSize = 12.sp)
+                            Text("连接", fontSize = 12.sp, maxLines = 1, softWrap = false)
                         }
                     }
                 }
@@ -599,30 +655,73 @@ private fun HostProfileCard(
     }
 }
 
+private data class HostEditorFields(
+    val name: String,
+    val host: String,
+    val portText: String,
+    val username: String,
+    val authType: AuthType,
+    val selectedKeyId: String?,
+    val autoAttach: String,
+    val localForwardSpec: String,
+    val keepAliveSec: String,
+    val autoReconnect: Boolean,
+    val pinInDaemon: Boolean,
+    val tag: String
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HostEditorDialog(
     initial: HostProfile?,
     keys: List<SshKeyRecord>,
+    onReadHostKey: (String, Int) -> Result<KnownHostKey?>,
+    onForgetHostKey: (String, Int) -> Result<Unit>,
     onDismiss: () -> Unit,
     onSave: (HostProfile) -> Unit
 ) {
-    var name by remember { mutableStateOf(initial?.name ?: "") }
-    var host by remember { mutableStateOf(initial?.host ?: "") }
-    var portText by remember { mutableStateOf((initial?.port ?: 22).toString()) }
-    var username by remember { mutableStateOf(initial?.username ?: "root") }
-    var authType by remember { mutableStateOf(initial?.authType ?: AuthType.PASSWORD) }
-    var password by remember { mutableStateOf(VaultCrypto.decrypt(initial?.encryptedPassword)) }
-    var selectedKeyId by remember { mutableStateOf(initial?.keyId ?: keys.firstOrNull()?.id) }
-    var autoAttach by remember { mutableStateOf(initial?.autoAttachCommand ?: "tmux new-session -A -s main || true") }
-    var keepAliveSec by remember { mutableStateOf((initial?.keepAliveIntervalSec ?: 15).toString()) }
-    var autoReconnect by remember { mutableStateOf(initial?.autoReconnect ?: true) }
-    var pinInDaemon by remember { mutableStateOf(initial?.pinInDaemon ?: true) }
-    var tag by remember { mutableStateOf(initial?.tag ?: "LAN") }
+    val context = LocalContext.current
+    val originalFields = remember {
+        HostEditorFields(
+            name = initial?.name.orEmpty(),
+            host = initial?.host.orEmpty(),
+            portText = (initial?.port ?: 22).toString(),
+            username = initial?.username ?: "root",
+            authType = initial?.authType ?: AuthType.PASSWORD,
+            selectedKeyId = initial?.keyId ?: keys.firstOrNull()?.id,
+            autoAttach = initial?.autoAttachCommand.orEmpty(),
+            localForwardSpec = initial?.localForwardSpec.orEmpty(),
+            keepAliveSec = (initial?.keepAliveIntervalSec ?: 15).toString(),
+            autoReconnect = initial?.autoReconnect ?: true,
+            pinInDaemon = initial?.pinInDaemon ?: true,
+            tag = initial?.tag ?: "LAN"
+        )
+    }
+    var fields by remember { mutableStateOf(originalFields) }
+    val originalPassword = remember { VaultCrypto.decrypt(initial?.encryptedPassword) }
+    var password by remember { mutableStateOf(originalPassword) }
     var keyMenuExpanded by remember { mutableStateOf(false) }
+    var hostKeyRevision by remember { mutableStateOf(0) }
+    var forgettingHostKey by remember { mutableStateOf<Pair<String, Int>?>(null) }
+    val host = fields.host
+    val portText = fields.portText
+    var hostKeyActionError by remember(host, portText) { mutableStateOf<String?>(null) }
+    val enteredPort = portText.toIntOrNull()
+    val validEndpoint = host.isNotBlank() && enteredPort != null && enteredPort in 1..65535
+    val forwardingOnly = fields.localForwardSpec.isNotBlank()
+    val invalidForward = forwardingOnly && LocalPortForward.parse(fields.localForwardSpec) == null
+    val savedHostKey = remember(host, portText, hostKeyRevision) {
+        if (validEndpoint) onReadHostKey(host, enteredPort) else Result.success(null)
+    }
+    val dismissEditor = {
+        if (fields != originalFields || password != originalPassword) {
+            Toast.makeText(context, "修改未保存", Toast.LENGTH_SHORT).show()
+        }
+        onDismiss()
+    }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = dismissEditor,
         title = { Text(if (initial == null) "新建 SSH 主机" else "编辑 SSH 主机") },
         text = {
             Column(
@@ -632,8 +731,8 @@ fun HostEditorDialog(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
+                    value = fields.name,
+                    onValueChange = { fields = fields.copy(name = it) },
                     label = { Text("别名（如：家用服务器）") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
@@ -641,14 +740,14 @@ fun HostEditorDialog(
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
                         value = host,
-                        onValueChange = { host = it },
+                        onValueChange = { fields = fields.copy(host = it) },
                         label = { Text("主机 IP / Tailscale 域名") },
                         singleLine = true,
                         modifier = Modifier.weight(2f)
                     )
                     OutlinedTextField(
                         value = portText,
-                        onValueChange = { portText = it.filter(Char::isDigit) },
+                        onValueChange = { fields = fields.copy(portText = it.filter(Char::isDigit)) },
                         label = { Text("端口") },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -656,12 +755,31 @@ fun HostEditorDialog(
                     )
                 }
                 OutlinedTextField(
-                    value = username,
-                    onValueChange = { username = it },
+                    value = fields.username,
+                    onValueChange = { fields = fields.copy(username = it) },
                     label = { Text("用户名") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                Text("服务器身份", style = MaterialTheme.typography.labelMedium)
+                val knownKey = savedHostKey.getOrNull()
+                Text(
+                    text = when {
+                        savedHostKey.isFailure -> savedHostKey.exceptionOrNull()?.message.orEmpty()
+                        knownKey != null -> "${knownKey.algorithm}\n${knownKey.fingerprintSha256}"
+                        else -> "此地址尚未保存主机指纹，首次连接时需要确认"
+                    },
+                    style = MaterialTheme.typography.bodySmall
+                )
+                if ((knownKey != null || savedHostKey.isFailure) && validEndpoint) {
+                    TextButton(
+                        onClick = { forgettingHostKey = host.trim() to enteredPort }
+                    ) { Text("清除旧指纹并重新核对") }
+                }
+                hostKeyActionError?.let {
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
 
                 Text("标签", style = MaterialTheme.typography.labelMedium)
                 Row(
@@ -670,8 +788,8 @@ fun HostEditorDialog(
                 ) {
                     listOf("LAN", "Tailscale", "Prod", "Lab").forEach { option ->
                         FilterChip(
-                            selected = tag == option,
-                            onClick = { tag = option },
+                            selected = fields.tag == option,
+                            onClick = { fields = fields.copy(tag = option) },
                             label = { Text(option) }
                         )
                     }
@@ -683,23 +801,23 @@ fun HostEditorDialog(
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     FilterChip(
-                        selected = authType == AuthType.PASSWORD,
-                        onClick = { authType = AuthType.PASSWORD },
+                        selected = fields.authType == AuthType.PASSWORD,
+                        onClick = { fields = fields.copy(authType = AuthType.PASSWORD) },
                         label = { Text("加密保存密码") }
                     )
                     FilterChip(
-                        selected = authType == AuthType.PUBLIC_KEY,
-                        onClick = { authType = AuthType.PUBLIC_KEY },
+                        selected = fields.authType == AuthType.PUBLIC_KEY,
+                        onClick = { fields = fields.copy(authType = AuthType.PUBLIC_KEY) },
                         label = { Text("SSH 私钥") }
                     )
                     FilterChip(
-                        selected = authType == AuthType.INTERACTIVE_OR_TAILSCALE,
-                        onClick = { authType = AuthType.INTERACTIVE_OR_TAILSCALE },
+                        selected = fields.authType == AuthType.INTERACTIVE_OR_TAILSCALE,
+                        onClick = { fields = fields.copy(authType = AuthType.INTERACTIVE_OR_TAILSCALE) },
                         label = { Text("Tailscale / 交互") }
                     )
                 }
 
-                if (authType != AuthType.PUBLIC_KEY) {
+                if (fields.authType != AuthType.PUBLIC_KEY) {
                     OutlinedTextField(
                         value = password,
                         onValueChange = { password = it },
@@ -710,7 +828,7 @@ fun HostEditorDialog(
                     )
                 }
 
-                if (authType == AuthType.PUBLIC_KEY) {
+                if (fields.authType == AuthType.PUBLIC_KEY) {
                     if (keys.isEmpty()) {
                         Text(
                             "尚未创建密钥，请先在侧栏「SSH 密钥库」生成 Ed25519 密钥",
@@ -722,7 +840,7 @@ fun HostEditorDialog(
                             expanded = keyMenuExpanded,
                             onExpandedChange = { keyMenuExpanded = !keyMenuExpanded }
                         ) {
-                            val selectedName = keys.firstOrNull { it.id == selectedKeyId }?.name ?: "选择私钥"
+                            val selectedName = keys.firstOrNull { it.id == fields.selectedKeyId }?.name ?: "选择私钥"
                             OutlinedTextField(
                                 value = selectedName,
                                 onValueChange = {},
@@ -741,7 +859,7 @@ fun HostEditorDialog(
                                     DropdownMenuItem(
                                         text = { Text("${key.name} (${key.algorithm})") },
                                         onClick = {
-                                            selectedKeyId = key.id
+                                            fields = fields.copy(selectedKeyId = key.id)
                                             keyMenuExpanded = false
                                         }
                                     )
@@ -752,26 +870,57 @@ fun HostEditorDialog(
                 }
 
                 OutlinedTextField(
-                    value = autoAttach,
-                    onValueChange = { autoAttach = it },
-                    label = { Text("登录后自动附着命令（防断线丢会话）") },
+                    value = fields.localForwardSpec,
+                    onValueChange = { fields = fields.copy(localForwardSpec = it) },
+                    label = { Text("本地端口转发（可选）") },
+                    placeholder = { Text("18765:127.0.0.1:8765") },
+                    supportingText = {
+                        Text(if (invalidForward) "格式为手机端口:目标地址:目标端口，手机端口须为 1024–65535"
+                        else "填写后仅转发端口，重新连接后生效")
+                    },
+                    isError = invalidForward,
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
-                    value = keepAliveSec,
-                    onValueChange = { keepAliveSec = it.filter(Char::isDigit) },
+                    value = fields.autoAttach,
+                    onValueChange = { fields = fields.copy(autoAttach = it) },
+                    label = { Text("登录后自动附着命令（可选）") },
+                    placeholder = { Text("留空则直接进入默认 Shell；Linux 可填 tmux") },
+                    enabled = !forwardingOnly,
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilterChip(
+                        selected = fields.autoAttach.trim() == "tmux new-session -A -s main",
+                        onClick = { fields = fields.copy(autoAttach = "tmux new-session -A -s main") },
+                        enabled = !forwardingOnly,
+                        label = { Text("填入 Linux tmux") }
+                    )
+                    if (fields.autoAttach.isNotEmpty()) {
+                        FilterChip(
+                            selected = false,
+                            onClick = { fields = fields.copy(autoAttach = "") },
+                            enabled = !forwardingOnly,
+                            label = { Text("清空") }
+                        )
+                    }
+                }
+                OutlinedTextField(
+                    value = fields.keepAliveSec,
+                    onValueChange = { fields = fields.copy(keepAliveSec = it.filter(Char::isDigit)) },
                     label = { Text("KeepAlive 心跳间隔 (秒)") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.fillMaxWidth()
                 )
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = autoReconnect, onCheckedChange = { autoReconnect = it })
+                    Checkbox(checked = fields.autoReconnect, onCheckedChange = { fields = fields.copy(autoReconnect = it) })
                     Text("断线/切网自动重连", style = MaterialTheme.typography.bodySmall)
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = pinInDaemon, onCheckedChange = { pinInDaemon = it })
+                    Checkbox(checked = fields.pinInDaemon, onCheckedChange = { fields = fields.copy(pinInDaemon = it) })
                     Text("在守护进程/开机恢复时常驻保活", style = MaterialTheme.typography.bodySmall)
                 }
             }
@@ -779,31 +928,58 @@ fun HostEditorDialog(
         confirmButton = {
             ButtonTextAction(
                 text = "保存",
-                enabled = host.isNotBlank() && username.isNotBlank(),
+                enabled = host.isNotBlank() && fields.username.isNotBlank() && !invalidForward,
                 onClick = {
                     val finalProfile = HostProfile(
                         id = initial?.id ?: java.util.UUID.randomUUID().toString(),
-                        name = name.trim().ifBlank { host.trim() },
+                        name = fields.name.trim().ifBlank { host.trim() },
                         host = host.trim(),
                         port = (portText.toIntOrNull() ?: 22).coerceIn(1, 65535),
-                        username = username.trim(),
-                        authType = authType,
+                        username = fields.username.trim(),
+                        authType = fields.authType,
                         encryptedPassword = password.takeIf { it.isNotEmpty() }?.let { VaultCrypto.encrypt(it) },
-                        keyId = if (authType == AuthType.PUBLIC_KEY) selectedKeyId else initial?.keyId,
-                        autoAttachCommand = autoAttach.trim(),
-                        keepAliveIntervalSec = (keepAliveSec.toIntOrNull() ?: 15).coerceIn(5, 120),
-                        autoReconnect = autoReconnect,
-                        pinInDaemon = pinInDaemon,
-                        tag = tag
+                        keyId = if (fields.authType == AuthType.PUBLIC_KEY) fields.selectedKeyId else initial?.keyId,
+                        autoAttachCommand = fields.autoAttach.trim(),
+                        keepAliveIntervalSec = (fields.keepAliveSec.toIntOrNull() ?: 15).coerceIn(5, 120),
+                        autoReconnect = fields.autoReconnect,
+                        pinInDaemon = fields.pinInDaemon,
+                        tag = fields.tag,
+                        localForwardSpec = fields.localForwardSpec.trim()
                     )
                     onSave(finalProfile)
                 }
             )
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("取消") }
+            TextButton(onClick = dismissEditor) { Text("取消") }
         }
     )
+
+    forgettingHostKey?.let { (targetHost, targetPort) ->
+        AlertDialog(
+            onDismissRequest = { forgettingHostKey = null },
+            title = { Text("清除已保存的主机指纹？") },
+            text = {
+                Text(
+                    "地址：${KnownHostKeyStore.endpoint(targetHost, targetPort)}\n\n" +
+                        "该地址的会话会断开，下次连接需要重新确认指纹。" +
+                        "请先通过可信渠道核对服务器是否确实更换了密钥。"
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    onForgetHostKey(targetHost, targetPort).fold(
+                        onSuccess = { hostKeyRevision++; hostKeyActionError = null },
+                        onFailure = { hostKeyActionError = it.message }
+                    )
+                    forgettingHostKey = null
+                }) { Text("清除并重新核对") }
+            },
+            dismissButton = {
+                TextButton(onClick = { forgettingHostKey = null }) { Text("取消") }
+            }
+        )
+    }
 }
 
 @Composable

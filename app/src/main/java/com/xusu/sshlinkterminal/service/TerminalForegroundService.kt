@@ -30,6 +30,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
 class TerminalForegroundService : Service() {
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -45,7 +49,10 @@ class TerminalForegroundService : Service() {
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             val app = application as LinkTerminalApp
-            app.sshManager.onNetworkAvailable()
+            serviceScope.launch {
+                delay(450L)
+                app.sshManager.onNetworkAvailable()
+            }
         }
     }
 
@@ -74,9 +81,26 @@ class TerminalForegroundService : Service() {
             ACTION_RECONNECT_ALL -> {
                 app.sshManager.reconnectAll()
             }
-            ACTION_RESTORE_PINNED, ACTION_WATCHDOG_REVIVE -> {
-                app.repository.appendLog("INFO", "Daemon", "守护进程拉起并恢复常驻会话")
+            ACTION_RESTORE_PINNED -> {
+                app.repository.appendLog("INFO", "Daemon", "开机/更新后自动拉起并恢复常驻会话")
                 app.sshManager.restorePinnedHosts()
+            }
+            ACTION_WATCHDOG_REVIVE -> {
+                val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+                app.repository.appendLog("WARN", "Daemon", "进程曾被系统回收，Shizuku 看门狗于 $timeStr 重建常驻会话")
+                app.sshManager.restorePinnedHosts(
+                    reviveReason = "[$timeStr App 进程曾被系统后台回收，守护已重建新 SSH 会话（建议交互进程运行于 tmux）]"
+                )
+            }
+            null -> {
+                // START_STICKY system restart after OEM kill delivers a null intent.
+                if (app.sshManager.activeConnectedCount() == 0) {
+                    val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+                    app.repository.appendLog("WARN", "Daemon", "系统于 $timeStr 通过 START_STICKY 重启前台服务，重建常驻会话")
+                    app.sshManager.restorePinnedHosts(
+                        reviveReason = "[$timeStr App 进程曾被系统终止后由 START_STICKY 重启，已重建新 SSH 会话（建议运行于 tmux）]"
+                    )
+                }
             }
         }
         return START_STICKY
@@ -98,10 +122,21 @@ class TerminalForegroundService : Service() {
         heartbeatJob?.cancel()
         heartbeatJob = serviceScope.launch {
             val app = application as LinkTerminalApp
+            var lastSummary = ""
+            var ticks = 0
             while (isActive) {
                 app.shizukuManager.sendHeartbeat()
-                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.notify(NOTIFICATION_ID, buildNotification())
+                val activeCount = app.sshManager.activeConnectedCount()
+                val avgRtt = app.sshManager.averageRttMs()
+                val watchdog = app.shizukuManager.guardStatus.value.watchdogActive
+                val summary = "$activeCount|$avgRtt|$watchdog"
+                // Avoid re-posting identical ongoing notifications every 15s to reduce OEM freezer triggers.
+                if (summary != lastSummary || ticks % 4 == 0) {
+                    lastSummary = summary
+                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    nm.notify(NOTIFICATION_ID, buildNotification())
+                }
+                ticks++
                 delay(15_000L)
             }
         }
@@ -143,12 +178,17 @@ class TerminalForegroundService : Service() {
     private fun registerNetworkMonitor() {
         if (networkCallbackRegistered) return
         try {
-            val request = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .build()
-            connectivityManager.registerNetworkCallback(request, networkCallback)
+            connectivityManager.registerDefaultNetworkCallback(networkCallback)
             networkCallbackRegistered = true
         } catch (_: Throwable) {
+            try {
+                val request = NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build()
+                connectivityManager.registerNetworkCallback(request, networkCallback)
+                networkCallbackRegistered = true
+            } catch (_: Throwable) {
+            }
         }
     }
 

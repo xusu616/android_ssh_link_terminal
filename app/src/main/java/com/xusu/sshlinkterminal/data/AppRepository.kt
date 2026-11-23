@@ -2,15 +2,27 @@ package com.xusu.sshlinkterminal.data
 
 import android.content.Context
 import androidx.core.content.edit
+import com.xusu.sshlinkterminal.ssh.KnownHostKeyStore
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import org.json.JSONArray
 import org.json.JSONObject
 
 class AppRepository(context: Context) {
 
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    val knownHostKeys = KnownHostKeyStore(
+        readEntry = { endpoint -> prefs.getString("known_host_key:$endpoint", null) },
+        writeEntry = { endpoint, value ->
+            val editor = prefs.edit()
+            if (value == null) editor.remove("known_host_key:$endpoint")
+            else editor.putString("known_host_key:$endpoint", value)
+            editor.commit()
+        }
+    )
 
     private val _hosts = MutableStateFlow(loadHosts())
     val hosts: StateFlow<List<HostProfile>> = _hosts.asStateFlow()
@@ -24,10 +36,10 @@ class AppRepository(context: Context) {
     private val _uiPreferences = MutableStateFlow(loadUiPreferences())
     val uiPreferences: StateFlow<UiPreferences> = _uiPreferences.asStateFlow()
 
-    private val _rttSamples = MutableStateFlow<List<RttSample>>(emptyList())
+    private val _rttSamples = MutableStateFlow(loadRttSamples())
     val rttSamples: StateFlow<List<RttSample>> = _rttSamples.asStateFlow()
 
-    private val _logs = MutableStateFlow<List<AppLogEntry>>(emptyList())
+    private val _logs = MutableStateFlow(loadLogs())
     val logs: StateFlow<List<AppLogEntry>> = _logs.asStateFlow()
 
     fun upsertHost(host: HostProfile) {
@@ -94,25 +106,47 @@ class AppRepository(context: Context) {
 
     fun appendRttSample(rttMs: Long, activeSessions: Int) {
         val nowSec = System.currentTimeMillis() / 1000L
-        val next = (_rttSamples.value + RttSample(nowSec, rttMs.coerceAtLeast(0L), activeSessions))
-            .takeLast(120)
-        _rttSamples.value = next
+        val sample = RttSample(nowSec, rttMs.coerceAtLeast(0L), activeSessions)
+        var snapshot: List<RttSample> = emptyList()
+        _rttSamples.update { current ->
+            val next = if (current.lastOrNull()?.timestampSec == nowSec) {
+                current.dropLast(1) + sample
+            } else {
+                (current + sample).takeLast(MAX_RTT_SAMPLES)
+            }
+            snapshot = next
+            next
+        }
+        saveRttSamples(snapshot)
     }
 
     fun appendLog(level: String, tag: String, message: String) {
-        val next = (_logs.value + AppLogEntry(level = level, tag = tag, message = message)).takeLast(300)
-        _logs.value = next
+        var snapshot: List<AppLogEntry> = emptyList()
+        _logs.update { current ->
+            val next = (current + AppLogEntry(level = level, tag = tag, message = message)).takeLast(300)
+            snapshot = next
+            next
+        }
+        saveLogs(snapshot)
     }
 
     fun clearLogs() {
         _logs.value = emptyList()
+        prefs.edit { remove(KEY_LOGS) }
+    }
+
+    fun hasPromptedShizukuPermission(): Boolean =
+        prefs.getBoolean(KEY_SHIZUKU_PROMPTED, false)
+
+    fun markShizukuPermissionPrompted() {
+        prefs.edit { putBoolean(KEY_SHIZUKU_PROMPTED, true) }
     }
 
     private fun loadHosts(): List<HostProfile> {
         val raw = prefs.getString(KEY_HOSTS, null) ?: return defaultHosts()
         return try {
             val arr = JSONArray(raw)
-            (0 until arr.length()).map { i ->
+            val parsed = (0 until arr.length()).map { i ->
                 val obj = arr.getJSONObject(i)
                 HostProfile(
                     id = obj.getString("id"),
@@ -128,8 +162,27 @@ class AppRepository(context: Context) {
                     keepAliveIntervalSec = obj.optInt("keepAliveIntervalSec", 15),
                     autoReconnect = obj.optBoolean("autoReconnect", true),
                     pinInDaemon = obj.optBoolean("pinInDaemon", true),
-                    tag = obj.optString("tag", "LAN")
+                    tag = obj.optString("tag", "LAN"),
+                    localForwardSpec = obj.optString("localForwardSpec", "")
                 )
+            }
+            if (!prefs.getBoolean(KEY_MIGRATED_LEGACY_TMUX_V1, false)) {
+                var changed = false
+                val cleaned = parsed.map { host ->
+                    if (host.autoAttachCommand.trim() == LEGACY_AUTO_ATTACH_CMD) {
+                        changed = true
+                        host.copy(autoAttachCommand = "")
+                    } else {
+                        host
+                    }
+                }
+                if (changed) {
+                    saveHosts(cleaned)
+                }
+                prefs.edit { putBoolean(KEY_MIGRATED_LEGACY_TMUX_V1, true) }
+                cleaned
+            } else {
+                parsed
             }
         } catch (_: Exception) {
             defaultHosts()
@@ -154,6 +207,7 @@ class AppRepository(context: Context) {
                 put("autoReconnect", host.autoReconnect)
                 put("pinInDaemon", host.pinInDaemon)
                 put("tag", host.tag)
+                put("localForwardSpec", host.localForwardSpec)
             })
         }
         prefs.edit { putString(KEY_HOSTS, arr.toString()) }
@@ -243,13 +297,24 @@ class AppRepository(context: Context) {
             wallpaperUri = prefs.getString("ui_wallpaper_uri", null),
             blurRadius = prefs.getFloat("ui_blur_radius", 18f),
             terminalScrimAlpha = prefs.getFloat("ui_terminal_scrim", 0.72f),
-            terminalFontSizeSp = prefs.getFloat("ui_terminal_font_sp", 13.5f),
+            terminalFontSizeSp = prefs.getFloat("ui_terminal_font_sp", 11.5f),
+            terminalUseMonospace = prefs.getBoolean("ui_terminal_use_mono", true),
+            terminalFontPreset = prefs.getString("ui_terminal_font_preset", "AUTO") ?: "AUTO",
+            terminalCustomFontPath = prefs.getString("ui_terminal_custom_font_path", null),
+            terminalCustomFontName = prefs.getString("ui_terminal_custom_font_name", null),
+            terminalNerdIconsEnabled = prefs.getBoolean("ui_terminal_nerd_icons_enabled", true),
+            terminalNerdIconsPath = prefs.getString("ui_terminal_nerd_icons_path", null),
+            terminalHorizontalScroll = prefs.getBoolean("ui_terminal_hscroll", true),
+            accentDepth = prefs.getFloat("ui_accent_depth", 0.28f),
             autoOpenOAuthUrl = prefs.getBoolean("ui_auto_open_oauth", true),
             springAnimation = prefs.getBoolean("ui_spring_anim", true),
             hapticFeedback = prefs.getBoolean("ui_haptic", true),
             autoHardenWithShizuku = prefs.getBoolean("ui_auto_harden_shizuku", true),
             autoStartOnBoot = prefs.getBoolean("ui_auto_start_boot", true),
-            topComponentPressedDown = prefs.getBoolean("ui_top_pressed_down", true)
+            topComponentPressedDown = prefs.getBoolean("ui_top_pressed_down", true),
+            chartAxisAnimation = prefs.getBoolean("ui_chart_axis_anim", true),
+            terminalNonTextInput = prefs.getBoolean("ui_terminal_non_text_input", true),
+            hideStatusBar = prefs.getBoolean("ui_hide_status_bar", false)
         )
     }
 
@@ -261,13 +326,38 @@ class AppRepository(context: Context) {
             putFloat("ui_blur_radius", value.blurRadius)
             putFloat("ui_terminal_scrim", value.terminalScrimAlpha)
             putFloat("ui_terminal_font_sp", value.terminalFontSizeSp)
+            putBoolean("ui_terminal_use_mono", value.terminalUseMonospace)
+            putString("ui_terminal_font_preset", value.terminalFontPreset)
+            putString("ui_terminal_custom_font_path", value.terminalCustomFontPath)
+            putString("ui_terminal_custom_font_name", value.terminalCustomFontName)
+            putBoolean("ui_terminal_nerd_icons_enabled", value.terminalNerdIconsEnabled)
+            putString("ui_terminal_nerd_icons_path", value.terminalNerdIconsPath)
+            putBoolean("ui_terminal_hscroll", value.terminalHorizontalScroll)
+            putFloat("ui_accent_depth", value.accentDepth)
             putBoolean("ui_auto_open_oauth", value.autoOpenOAuthUrl)
             putBoolean("ui_spring_anim", value.springAnimation)
             putBoolean("ui_haptic", value.hapticFeedback)
             putBoolean("ui_auto_harden_shizuku", value.autoHardenWithShizuku)
             putBoolean("ui_auto_start_boot", value.autoStartOnBoot)
             putBoolean("ui_top_pressed_down", value.topComponentPressedDown)
+            putBoolean("ui_chart_axis_anim", value.chartAxisAnimation)
+            putBoolean("ui_terminal_non_text_input", value.terminalNonTextInput)
+            putBoolean("ui_hide_status_bar", value.hideStatusBar)
         }
+    }
+
+    private fun loadRttSamples(): List<RttSample> =
+        decodeRttSamplesJson(prefs.getString(KEY_RTT_SAMPLES, null))
+
+    private fun saveRttSamples(samples: List<RttSample>) {
+        prefs.edit { putString(KEY_RTT_SAMPLES, encodeRttSamplesJson(samples)) }
+    }
+
+    private fun loadLogs(): List<AppLogEntry> =
+        decodeLogsJson(prefs.getString(KEY_LOGS, null))
+
+    private fun saveLogs(entries: List<AppLogEntry>) {
+        prefs.edit { putString(KEY_LOGS, encodeLogsJson(entries)) }
     }
 
     private fun defaultHosts(): List<HostProfile> = listOf(
@@ -278,7 +368,7 @@ class AppRepository(context: Context) {
             port = 22,
             username = "root",
             authType = AuthType.PASSWORD,
-            autoAttachCommand = "tmux new-session -A -s main || true",
+            autoAttachCommand = "",
             keepAliveIntervalSec = 15,
             autoReconnect = true,
             pinInDaemon = true,
@@ -291,7 +381,7 @@ class AppRepository(context: Context) {
             port = 22,
             username = "root",
             authType = AuthType.INTERACTIVE_OR_TAILSCALE,
-            autoAttachCommand = "tmux new-session -A -s main || true",
+            autoAttachCommand = "",
             keepAliveIntervalSec = 15,
             autoReconnect = true,
             pinInDaemon = true,
@@ -315,5 +405,84 @@ class AppRepository(context: Context) {
         private const val KEY_HOSTS = "hosts_json"
         private const val KEY_KEYS = "keys_json"
         private const val KEY_MACROS = "macros_json"
+        private const val KEY_RTT_SAMPLES = "rtt_samples_json"
+        private const val MAX_RTT_SAMPLES = 1440
+        private const val KEY_LOGS = "logs_json"
+        private const val MAX_PERSISTED_LOGS = 120
+        private const val KEY_SHIZUKU_PROMPTED = "shizuku_permission_prompted"
+        private const val KEY_MIGRATED_LEGACY_TMUX_V1 = "migrated_legacy_tmux_v1"
+        private const val LEGACY_AUTO_ATTACH_CMD = "tmux new-session -A -s main || true"
+
+        internal fun encodeLogsJson(entries: List<AppLogEntry>): String {
+            val array = JSONArray()
+            entries.takeLast(MAX_PERSISTED_LOGS).forEach { item ->
+                array.put(
+                    JSONObject().apply {
+                        put("ts", item.timestampMillis)
+                        put("lvl", item.level)
+                        put("tag", item.tag)
+                        put("msg", item.message)
+                    }
+                )
+            }
+            return array.toString()
+        }
+
+        internal fun decodeLogsJson(raw: String?): List<AppLogEntry> {
+            if (raw.isNullOrBlank()) return emptyList()
+            return runCatching {
+                val arr = JSONArray(raw)
+                buildList(arr.length()) {
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val msg = obj.optString("msg", "")
+                        if (msg.isEmpty()) continue
+                        add(
+                            AppLogEntry(
+                                timestampMillis = obj.optLong("ts", System.currentTimeMillis()),
+                                level = obj.optString("lvl", "INFO"),
+                                tag = obj.optString("tag", "App"),
+                                message = msg
+                            )
+                        )
+                    }
+                }.takeLast(MAX_PERSISTED_LOGS)
+            }.getOrDefault(emptyList())
+        }
+
+        internal fun encodeRttSamplesJson(samples: List<RttSample>): String {
+            val array = JSONArray()
+            samples.takeLast(MAX_RTT_SAMPLES).forEach { item ->
+                array.put(
+                    JSONObject().apply {
+                        put("t", item.timestampSec)
+                        put("r", item.rttMs)
+                        put("a", item.activeSessions)
+                    }
+                )
+            }
+            return array.toString()
+        }
+
+        internal fun decodeRttSamplesJson(raw: String?): List<RttSample> {
+            if (raw.isNullOrBlank()) return emptyList()
+            return runCatching {
+                val arr = JSONArray(raw)
+                buildList(arr.length()) {
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val ts = obj.optLong("t", -1L)
+                        if (ts <= 0L) continue
+                        add(
+                            RttSample(
+                                timestampSec = ts,
+                                rttMs = obj.optLong("r", 0L).coerceAtLeast(0L),
+                                activeSessions = obj.optInt("a", 0).coerceAtLeast(0)
+                            )
+                        )
+                    }
+                }.takeLast(MAX_RTT_SAMPLES)
+            }.getOrDefault(emptyList())
+        }
     }
 }

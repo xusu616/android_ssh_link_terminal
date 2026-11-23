@@ -136,7 +136,7 @@ fun GuardStatusOverlay(
                                     fontWeight = FontWeight.Bold
                                 )
                                 Text(
-                                    "解决锁后台仍被系统回收导致 SSH/OAuth 中断",
+                                    "OPPO/一加等系统请额外点右下「自启动/省电 -> 耗电管理」开启“允许完全后台行为”，防止切出后台数秒后被墓碑冻结断连",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -178,11 +178,12 @@ fun GuardStatusOverlay(
                         GuardCheckRow(
                             icon = Icons.Rounded.Shield,
                             title = "Shizuku Doze / Standby / AppOps 加固",
-                            subtitle = guardStatus.lastReport.ifBlank { "将进程设为 Active 并允许后台任意运行" },
+                            subtitle = guardStatus.lastReport.ifBlank { "将进程设为白名单并启动 Daemon 看门狗" },
                             passed = guardStatus.dozeWhitelisted == true &&
+                                guardStatus.standbyBucketActive != false &&
                                 guardStatus.appOpsBackgroundAllowed == true &&
                                 guardStatus.watchdogActive,
-                            actionLabel = "加固",
+                            actionLabel = "执行加固",
                             onAction = onApplyShizukuHarden
                         )
 

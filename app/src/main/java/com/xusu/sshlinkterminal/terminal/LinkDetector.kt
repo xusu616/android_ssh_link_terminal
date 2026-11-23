@@ -1,5 +1,6 @@
 package com.xusu.sshlinkterminal.terminal
 
+import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
@@ -90,17 +91,22 @@ object LinkDetector {
         } catch (_: Exception) {
             return false
         }
+        val needsNewTask = context !is Activity
         return try {
             val customTabsIntent = CustomTabsIntent.Builder()
                 .setShowTitle(true)
                 .build()
-            customTabsIntent.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (needsNewTask) {
+                customTabsIntent.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
             customTabsIntent.launchUrl(context, uri)
             true
         } catch (_: Exception) {
             try {
                 val fallback = Intent(Intent.ACTION_VIEW, uri).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    if (needsNewTask) {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
                 }
                 context.startActivity(fallback)
                 true

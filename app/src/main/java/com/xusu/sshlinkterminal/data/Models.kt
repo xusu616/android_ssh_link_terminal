@@ -17,7 +17,15 @@ enum class SessionState {
     CONNECTED,
     RECONNECTING,
     DISCONNECTED,
-    ERROR
+    ERROR;
+
+    fun isActiveChannel(): Boolean = when (this) {
+        CONNECTED,
+        CONNECTING,
+        AWAITING_INPUT,
+        AWAITING_OAUTH -> true
+        else -> false
+    }
 }
 
 enum class MacroCategory {
@@ -39,7 +47,8 @@ data class HostProfile(
     val keepAliveIntervalSec: Int = 15,
     val autoReconnect: Boolean = true,
     val pinInDaemon: Boolean = true,
-    val tag: String = "LAN"
+    val tag: String = "LAN",
+    val localForwardSpec: String = ""
 )
 
 data class SshKeyRecord(
@@ -69,13 +78,24 @@ data class UiPreferences(
     val wallpaperUri: String? = null,
     val blurRadius: Float = 18f,
     val terminalScrimAlpha: Float = 0.72f,
-    val terminalFontSizeSp: Float = 13.5f,
+    val terminalFontSizeSp: Float = 11.5f,
+    val terminalUseMonospace: Boolean = true,
+    val terminalFontPreset: String = "AUTO",
+    val terminalCustomFontPath: String? = null,
+    val terminalCustomFontName: String? = null,
+    val terminalNerdIconsEnabled: Boolean = true,
+    val terminalNerdIconsPath: String? = null,
+    val terminalHorizontalScroll: Boolean = true,
+    val accentDepth: Float = 0.28f,
     val autoOpenOAuthUrl: Boolean = true,
     val springAnimation: Boolean = true,
     val hapticFeedback: Boolean = true,
     val autoHardenWithShizuku: Boolean = true,
     val autoStartOnBoot: Boolean = true,
-    val topComponentPressedDown: Boolean = true
+    val topComponentPressedDown: Boolean = true,
+    val chartAxisAnimation: Boolean = true,
+    val terminalNonTextInput: Boolean = true,
+    val hideStatusBar: Boolean = false
 )
 
 data class ColorBag(
@@ -119,7 +139,8 @@ data class InteractivePromptRequest(
     val title: String,
     val instruction: String,
     val prompts: List<String>,
-    val echo: List<Boolean>
+    val echo: List<Boolean>,
+    val confirmButtonText: String = "提交"
 )
 
 data class GuardStatus(

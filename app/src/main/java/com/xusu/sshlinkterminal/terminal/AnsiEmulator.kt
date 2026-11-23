@@ -24,10 +24,17 @@ data class TerminalRenderLine(
     val plainText: String
 )
 
+data class TerminalSnapshotState(
+    val lines: List<TerminalRenderLine>,
+    val windowTitle: String,
+    val sequence: Long
+)
+
 private data class Cell(
     var ch: Char = ' ',
     var style: TerminalStyle = TerminalStyle(),
-    var oscLink: String? = null
+    var oscLink: String? = null,
+    var isWideTrail: Boolean = false
 )
 
 /**
@@ -37,7 +44,8 @@ private data class Cell(
 class AnsiEmulator(
     initialCols: Int = 80,
     initialRows: Int = 24,
-    private val maxScrollback: Int = 1800
+    private val maxScrollback: Int = 1800,
+    private val onTerminalResponse: ((String) -> Unit)? = null
 ) {
     var cols: Int = initialCols.coerceIn(20, 240)
         private set
@@ -61,7 +69,16 @@ class AnsiEmulator(
     private var scrollTop = 0
     private var scrollBottom = rows - 1
 
-    private enum class ParserState { TEXT, ESC, CSI, OSC, OSC_ESC }
+    private enum class ParserState {
+        TEXT,
+        ESC,
+        ESC_INTERMEDIATE,
+        CSI,
+        OSC,
+        OSC_ESC,
+        STRING_ST,
+        STRING_ST_ESC
+    }
 
     private var state = ParserState.TEXT
     private val csiBuf = StringBuilder()
@@ -74,51 +91,135 @@ class AnsiEmulator(
     private var pendingBytes = ByteArray(0)
 
     private val lock = Any()
+    private val responseQueue = ArrayList<String>(4)
+    private var mutationSeq = 0L
 
     fun resize(newCols: Int, newRows: Int): Unit = synchronized(lock) {
         val targetCols = newCols.coerceIn(20, 240)
         val targetRows = newRows.coerceIn(8, 120)
         if (targetCols == cols && targetRows == rows) return@synchronized
 
-        primaryScreen = resizeGrid(primaryScreen, targetRows, targetCols)
-        altScreen = resizeGrid(altScreen, targetRows, targetCols)
+        val primaryAnchorRow = if (usingAltScreen) savedCursorRow else cursorRow
+        val primaryContentBottom = maxOf(primaryAnchorRow, findLastNonBlankRow(primaryScreen))
+        val primaryDrop = if (targetRows < rows && primaryContentBottom >= targetRows) {
+            (primaryContentBottom - (targetRows - 1)).coerceIn(0, rows - targetRows)
+        } else {
+            0
+        }
+        if (primaryDrop > 0) {
+            for (r in 0 until primaryDrop) {
+                if (scrollback.size >= maxScrollback) {
+                    scrollback.removeFirst()
+                }
+                scrollback.addLast(Array(cols) { idx -> primaryScreen[r][idx].copy() })
+            }
+        }
+        primaryScreen = resizeGrid(primaryScreen, targetRows, targetCols, startRow = primaryDrop)
+
+        val altDrop = if (usingAltScreen && targetRows < rows && cursorRow >= targetRows) {
+            (cursorRow - (targetRows - 1)).coerceIn(0, rows - targetRows)
+        } else {
+            0
+        }
+        altScreen = resizeGrid(altScreen, targetRows, targetCols, startRow = altDrop)
+
         cols = targetCols
         rows = targetRows
         scrollTop = 0
         scrollBottom = rows - 1
-        cursorRow = cursorRow.coerceIn(0, rows - 1)
+        if (usingAltScreen) {
+            savedCursorRow = (savedCursorRow - primaryDrop).coerceIn(0, rows - 1)
+            savedCursorCol = savedCursorCol.coerceIn(0, cols - 1)
+            cursorRow = (cursorRow - altDrop).coerceIn(0, rows - 1)
+        } else {
+            cursorRow = (cursorRow - primaryDrop).coerceIn(0, rows - 1)
+        }
         cursorCol = cursorCol.coerceIn(0, cols - 1)
+        mutationSeq++
     }
 
     fun feedBytes(bytes: ByteArray, length: Int = bytes.size): String {
-        val combined = if (pendingBytes.isEmpty()) {
-            bytes.copyOf(length)
-        } else {
-            ByteArray(pendingBytes.size + length).also {
-                System.arraycopy(pendingBytes, 0, it, 0, pendingBytes.size)
-                System.arraycopy(bytes, 0, it, pendingBytes.size, length)
+        var responses: List<String> = emptyList()
+        val decoded = synchronized(lock) {
+            val safeLen = length.coerceIn(0, bytes.size)
+            if (safeLen == 0 && pendingBytes.isEmpty()) return@synchronized ""
+            val combined = if (pendingBytes.isEmpty()) {
+                bytes.copyOf(safeLen)
+            } else {
+                ByteArray(pendingBytes.size + safeLen).also {
+                    System.arraycopy(pendingBytes, 0, it, 0, pendingBytes.size)
+                    System.arraycopy(bytes, 0, it, pendingBytes.size, safeLen)
+                }
             }
+            val inBuf = ByteBuffer.wrap(combined)
+            val outBuf = CharBuffer.allocate(combined.size * 2 + 4)
+            utf8Decoder.decode(inBuf, outBuf, false)
+            pendingBytes = if (inBuf.hasRemaining()) {
+                ByteArray(inBuf.remaining()).also { inBuf.get(it) }
+            } else {
+                ByteArray(0)
+            }
+            outBuf.flip()
+            val text = outBuf.toString()
+            if (text.isNotEmpty()) {
+                for (ch in text) {
+                    processChar(ch)
+                }
+                mutationSeq++
+            }
+            responses = drainResponsesLocked()
+            text
         }
-        val inBuf = ByteBuffer.wrap(combined)
-        val outBuf = CharBuffer.allocate(combined.size * 2 + 4)
-        utf8Decoder.decode(inBuf, outBuf, false)
-        pendingBytes = if (inBuf.hasRemaining()) {
-            ByteArray(inBuf.remaining()).also { inBuf.get(it) }
-        } else {
-            ByteArray(0)
-        }
-        outBuf.flip()
-        val decoded = outBuf.toString()
-        if (decoded.isNotEmpty()) {
-            feedText(decoded)
-        }
+        responses.forEach { onTerminalResponse?.invoke(it) }
         return decoded
     }
 
-    fun feedText(text: String) = synchronized(lock) {
-        for (ch in text) {
-            processChar(ch)
+    fun feedText(text: String) {
+        val responses = synchronized(lock) {
+            for (ch in text) {
+                processChar(ch)
+            }
+            if (text.isNotEmpty()) {
+                mutationSeq++
+            }
+            drainResponsesLocked()
         }
+        responses.forEach { onTerminalResponse?.invoke(it) }
+    }
+
+    private fun drainResponsesLocked(): List<String> {
+        if (responseQueue.isEmpty()) return emptyList()
+        val copy = responseQueue.toList()
+        responseQueue.clear()
+        return copy
+    }
+
+    private fun enqueueResponse(response: String) {
+        if (onTerminalResponse != null && responseQueue.size < 256) {
+            responseQueue.add(response)
+        }
+    }
+
+    private fun resetParserLocked() {
+        state = ParserState.TEXT
+        csiBuf.setLength(0)
+        oscBuf.setLength(0)
+        pendingBytes = ByteArray(0)
+    }
+
+    fun resetParserState() = synchronized(lock) {
+        resetParserLocked()
+    }
+
+    /**
+     * Leaves the alternate screen buffer if active (e.g. when a TUI process ends due to transport
+     * disconnect), restoring the primary screen and scrollback visibility.
+     */
+    fun exitAltScreenIfActive(): Boolean = synchronized(lock) {
+        if (!usingAltScreen) return@synchronized false
+        switchToAltScreen(false)
+        mutationSeq++
+        true
     }
 
     fun clear() = synchronized(lock) {
@@ -128,12 +229,30 @@ class AnsiEmulator(
         usingAltScreen = false
         cursorRow = 0
         cursorCol = 0
+        savedCursorRow = 0
+        savedCursorCol = 0
         scrollTop = 0
         scrollBottom = rows - 1
         currentStyle = TerminalStyle()
+        currentOscLink = null
+        windowTitle = ""
+        resetParserLocked()
+        mutationSeq++
+    }
+
+    fun snapshotState(): TerminalSnapshotState = synchronized(lock) {
+        TerminalSnapshotState(
+            lines = snapshotLinesLocked(),
+            windowTitle = windowTitle,
+            sequence = mutationSeq
+        )
     }
 
     fun snapshotLines(): List<TerminalRenderLine> = synchronized(lock) {
+        snapshotLinesLocked()
+    }
+
+    private fun snapshotLinesLocked(): List<TerminalRenderLine> {
         val allRows = ArrayList<Array<Cell>>(scrollback.size + rows)
         if (!usingAltScreen) {
             allRows.addAll(scrollback)
@@ -154,13 +273,31 @@ class AnsiEmulator(
     private fun createScreen(rCount: Int, cCount: Int): Array<Array<Cell>> =
         Array(rCount) { Array(cCount) { Cell() } }
 
-    private fun resizeGrid(old: Array<Array<Cell>>, newRows: Int, newCols: Int): Array<Array<Cell>> {
+    private fun findLastNonBlankRow(screen: Array<Array<Cell>>): Int {
+        var r = screen.lastIndex
+        while (r > 0 && isBlankRow(screen[r])) {
+            r--
+        }
+        return r
+    }
+
+    private fun resizeGrid(
+        old: Array<Array<Cell>>,
+        newRows: Int,
+        newCols: Int,
+        startRow: Int = 0
+    ): Array<Array<Cell>> {
         val next = createScreen(newRows, newCols)
-        val copyRows = minOf(old.size, newRows)
+        val availableRows = (old.size - startRow).coerceAtLeast(0)
+        val copyRows = minOf(availableRows, newRows)
         for (r in 0 until copyRows) {
-            val copyCols = minOf(old[r].size, newCols)
+            val srcRow = old[startRow + r]
+            val copyCols = minOf(srcRow.size, newCols)
             for (c in 0 until copyCols) {
-                next[r][c] = old[r][c].copy()
+                next[r][c] = srcRow[c].copy()
+            }
+            if (newCols in 1..<srcRow.size && next[r][newCols - 1].isWideTrail) {
+                next[r][newCols - 1] = Cell()
             }
         }
         return next
@@ -190,6 +327,11 @@ class AnsiEmulator(
                     oscBuf.setLength(0)
                     state = ParserState.OSC
                 }
+                'P', '_', '^', 'X' -> {
+                    // DCS / APC / PM / SOS strings terminated cleanly by ST or BEL
+                    oscBuf.setLength(0)
+                    state = ParserState.STRING_ST
+                }
                 '7' -> {
                     savedCursorRow = cursorRow
                     savedCursorCol = cursorCol
@@ -204,52 +346,136 @@ class AnsiEmulator(
                     reverseIndex()
                     state = ParserState.TEXT
                 }
+                'Z' -> {
+                    // Legacy VT100 DECID -> respond with Primary Device Attributes
+                    enqueueResponse("\u001B[?62;22c")
+                    state = ParserState.TEXT
+                }
                 'c' -> {
                     clear()
                     state = ParserState.TEXT
                 }
-                '(', ')' -> state = ParserState.TEXT // Charset designation ignored cleanly
+                in '\u0020'..'\u002F' -> {
+                    // ECMA-48 intermediate bytes such as ESC ( B / ESC ) 0 / ESC # 8
+                    state = ParserState.ESC_INTERMEDIATE
+                }
                 else -> state = ParserState.TEXT
             }
 
-            ParserState.CSI -> {
-                if (ch.code in 0x40..0x7E) {
-                    executeCsi(csiBuf.toString(), ch)
+            ParserState.ESC_INTERMEDIATE -> {
+                if (ch == '\u001B') {
+                    state = ParserState.ESC
+                } else if (ch == '\u0018' || ch == '\u001A') {
                     state = ParserState.TEXT
-                } else {
-                    csiBuf.append(ch)
+                } else if (ch.code !in 0x20..0x2F) {
+                    // Consume final byte and return cleanly to TEXT
+                    state = ParserState.TEXT
                 }
             }
 
-            ParserState.OSC -> when (ch) {
-                '\u0007' -> {
+            ParserState.CSI -> when {
+                ch == '\u001B' -> {
+                    csiBuf.setLength(0)
+                    state = ParserState.ESC
+                }
+                ch == '\u0018' || ch == '\u001A' -> {
+                    csiBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+                ch.code in 0x40..0x7E -> {
+                    executeCsi(csiBuf.toString(), ch)
+                    csiBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+                csiBuf.length < 256 -> csiBuf.append(ch)
+            }
+
+            ParserState.OSC -> when {
+                ch == '\u0007' -> {
                     executeOsc(oscBuf.toString())
+                    oscBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+                ch == '\u001B' -> state = ParserState.OSC_ESC
+                ch == '\u0018' || ch == '\u001A' -> {
+                    oscBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+                oscBuf.length < 4096 -> oscBuf.append(ch)
+                else -> {
+                    oscBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+            }
+
+            ParserState.OSC_ESC -> when (ch) {
+                '\\' -> {
+                    executeOsc(oscBuf.toString())
+                    oscBuf.setLength(0)
                     state = ParserState.TEXT
                 }
                 '\u001B' -> state = ParserState.OSC_ESC
-                else -> oscBuf.append(ch)
+                else -> {
+                    if (oscBuf.length < 4094) {
+                        oscBuf.append('\u001B').append(ch)
+                        state = ParserState.OSC
+                    } else {
+                        oscBuf.setLength(0)
+                        state = ParserState.TEXT
+                    }
+                }
             }
 
-            ParserState.OSC_ESC -> {
-                if (ch == '\\') {
-                    executeOsc(oscBuf.toString())
+            ParserState.STRING_ST -> when {
+                ch == '\u0007' || ch == '\u0018' || ch == '\u001A' -> {
+                    oscBuf.setLength(0)
                     state = ParserState.TEXT
-                } else {
-                    oscBuf.append('\u001B').append(ch)
-                    state = ParserState.OSC
                 }
+                ch == '\u001B' -> state = ParserState.STRING_ST_ESC
+                oscBuf.length < 8192 -> oscBuf.append(ch)
+                else -> {
+                    oscBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+            }
+
+            ParserState.STRING_ST_ESC -> when (ch) {
+                '\\' -> {
+                    oscBuf.setLength(0)
+                    state = ParserState.TEXT
+                }
+                '\u001B' -> state = ParserState.STRING_ST_ESC
+                else -> state = ParserState.STRING_ST
             }
         }
     }
 
     private fun putChar(ch: Char) {
-        if (cursorCol >= cols) {
+        val wide = isWideChar(ch)
+        val reserveTwoCells = wide || Character.isHighSurrogate(ch)
+        if (reserveTwoCells && cursorCol >= cols - 1) {
+            if (cursorCol < cols) {
+                activeScreen()[cursorRow][cursorCol] = Cell()
+            }
+            cursorCol = 0
+            lineFeed()
+        } else if (cursorCol >= cols) {
             cursorCol = 0
             lineFeed()
         }
         val row = activeScreen()[cursorRow]
-        row[cursorCol] = Cell(ch = ch, style = currentStyle, oscLink = currentOscLink)
-        cursorCol++
+        if (cursorCol > 0 && (row[cursorCol].isWideTrail ||
+                (Character.isLowSurrogate(row[cursorCol].ch) && Character.isHighSurrogate(row[cursorCol - 1].ch)))
+        ) {
+            row[cursorCol - 1] = Cell()
+        }
+        row[cursorCol] = Cell(ch = ch, style = currentStyle, oscLink = currentOscLink, isWideTrail = false)
+        if (wide && cursorCol + 1 < cols) {
+            row[cursorCol + 1] = Cell(ch = '\u0000', style = currentStyle, oscLink = currentOscLink, isWideTrail = true)
+            cursorCol += 2
+        } else {
+            cursorCol++
+        }
     }
 
     private fun lineFeed() {
@@ -295,9 +521,24 @@ class AnsiEmulator(
     }
 
     private fun executeCsi(rawParams: String, finalChar: Char) {
+        if (rawParams.startsWith(">")) {
+            when (finalChar) {
+                'c' -> enqueueResponse("\u001B[>0;10;1c") // Secondary Device Attributes (DA2)
+                'q' -> enqueueResponse("\u001BP>|LinkTerm(1.0.8)\u001B\\") // XTVERSION
+            }
+            return
+        }
+        if (rawParams.startsWith("<") || rawParams.startsWith("=")) {
+            // Private Kitty / DA3 prefixes must not leak into standard VT CSI commands
+            return
+        }
+
         val isPrivate = rawParams.startsWith("?")
         val clean = if (isPrivate) rawParams.substring(1) else rawParams
-        val params = if (clean.isEmpty()) emptyList() else clean.split(';').map { it.toIntOrNull() ?: 0 }
+        val hasDollarIntermediate = clean.endsWith("$")
+        val paramBody = if (hasDollarIntermediate) clean.dropLast(1) else clean
+        val rawTokens = if (paramBody.isEmpty()) emptyList() else paramBody.split(';')
+        val params = rawTokens.map { it.toIntOrNull() ?: 0 }
 
         if (isPrivate) {
             when (finalChar) {
@@ -307,43 +548,70 @@ class AnsiEmulator(
                 'l' -> params.forEach { p ->
                     if (p == 1049 || p == 1047 || p == 47) switchToAltScreen(false)
                 }
+                'n' -> {
+                    if (params.firstOrNull() == 6) {
+                        enqueueResponse("\u001B[?${cursorRow + 1};${cursorCol + 1}R")
+                    }
+                }
+                'p' -> if (hasDollarIntermediate) {
+                    val mode = params.firstOrNull() ?: 0
+                    enqueueResponse("\u001B[?$mode;0\$y") // DECRPM: mode not recognized / unset
+                }
             }
             return
         }
 
+        if (hasDollarIntermediate && finalChar == 'p') {
+            val mode = params.firstOrNull() ?: 0
+            enqueueResponse("\u001B[$mode;0\$y") // Standard ANSI DECRQM
+            return
+        }
+
         when (finalChar) {
-            'A' -> cursorRow = (cursorRow - (params.firstOrNull()?.takeIf { it > 0 } ?: 1)).coerceAtLeast(0)
-            'B' -> cursorRow = (cursorRow + (params.firstOrNull()?.takeIf { it > 0 } ?: 1)).coerceAtMost(rows - 1)
-            'C' -> cursorCol = (cursorCol + (params.firstOrNull()?.takeIf { it > 0 } ?: 1)).coerceAtMost(cols - 1)
-            'D' -> cursorCol = (cursorCol - (params.firstOrNull()?.takeIf { it > 0 } ?: 1)).coerceAtLeast(0)
+            'c' -> {
+                // Primary Device Attributes (DA1): VT220 + ANSI Color (prevents Fish 4.x 10s query timeout)
+                if (params.isEmpty() || params.firstOrNull() == 0) {
+                    enqueueResponse("\u001B[?62;22c")
+                }
+            }
+            'n' -> {
+                when (params.firstOrNull()) {
+                    5 -> enqueueResponse("\u001B[0n") // DSR: Terminal OK
+                    6 -> enqueueResponse("\u001B[${cursorRow + 1};${cursorCol + 1}R") // CPR: Cursor Position Report
+                }
+            }
+            'A' -> cursorRow = (cursorRow - (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, rows - 1)
+            'B' -> cursorRow = (cursorRow + (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, rows - 1)
+            'C' -> cursorCol = (cursorCol + (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, cols - 1)
+            'D' -> cursorCol = (cursorCol - (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, cols - 1)
             'E' -> {
-                cursorRow = (cursorRow + (params.firstOrNull()?.takeIf { it > 0 } ?: 1)).coerceAtMost(rows - 1)
+                cursorRow = (cursorRow + (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, rows - 1)
                 cursorCol = 0
             }
             'F' -> {
-                cursorRow = (cursorRow - (params.firstOrNull()?.takeIf { it > 0 } ?: 1)).coerceAtLeast(0)
+                cursorRow = (cursorRow - (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1)).coerceIn(0, rows - 1)
                 cursorCol = 0
             }
             'G', '`' -> {
-                val targetCol = (params.firstOrNull()?.takeIf { it > 0 } ?: 1) - 1
+                val targetCol = (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1) - 1
                 cursorCol = targetCol.coerceIn(0, cols - 1)
             }
             'd' -> {
-                val targetRow = (params.firstOrNull()?.takeIf { it > 0 } ?: 1) - 1
+                val targetRow = (params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1) - 1
                 cursorRow = targetRow.coerceIn(0, rows - 1)
             }
             'H', 'f' -> {
-                val r = (params.getOrNull(0)?.takeIf { it > 0 } ?: 1) - 1
-                val c = (params.getOrNull(1)?.takeIf { it > 0 } ?: 1) - 1
+                val r = (params.getOrNull(0)?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1) - 1
+                val c = (params.getOrNull(1)?.takeIf { it > 0 }?.coerceAtMost(10_000) ?: 1) - 1
                 cursorRow = r.coerceIn(0, rows - 1)
                 cursorCol = c.coerceIn(0, cols - 1)
             }
             'J' -> eraseDisplay(params.firstOrNull() ?: 0)
             'K' -> eraseLine(params.firstOrNull() ?: 0)
-            'L' -> insertLines(params.firstOrNull()?.takeIf { it > 0 } ?: 1)
-            'M' -> deleteLines(params.firstOrNull()?.takeIf { it > 0 } ?: 1)
-            'P' -> deleteChars(params.firstOrNull()?.takeIf { it > 0 } ?: 1)
-            'X' -> eraseChars(params.firstOrNull()?.takeIf { it > 0 } ?: 1)
+            'L' -> insertLines(params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(rows) ?: 1)
+            'M' -> deleteLines(params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(rows) ?: 1)
+            'P' -> deleteChars(params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(cols) ?: 1)
+            'X' -> eraseChars(params.firstOrNull()?.takeIf { it > 0 }?.coerceAtMost(cols) ?: 1)
             'r' -> {
                 val top = ((params.getOrNull(0)?.takeIf { it > 0 } ?: 1) - 1).coerceIn(0, rows - 1)
                 val bottom = ((params.getOrNull(1)?.takeIf { it > 0 } ?: rows) - 1).coerceIn(0, rows - 1)
@@ -354,7 +622,7 @@ class AnsiEmulator(
                     cursorCol = 0
                 }
             }
-            'm' -> applySgr(if (params.isEmpty()) listOf(0) else params)
+            'm' -> applySgrTokens(if (rawTokens.isEmpty()) listOf("0") else rawTokens)
             's' -> {
                 savedCursorRow = cursorRow
                 savedCursorCol = cursorCol
@@ -459,6 +727,50 @@ class AnsiEmulator(
         }
     }
 
+    private fun applySgrTokens(tokens: List<String>) {
+        val expanded = ArrayList<Int>(tokens.size)
+        for (tok in tokens) {
+            if (tok.isEmpty()) {
+                expanded.add(0)
+                continue
+            }
+            if (':' in tok) {
+                val subs = tok.split(':')
+                val head = subs.getOrNull(0)?.toIntOrNull() ?: continue
+                when (head) {
+                    4 -> {
+                        val sub = subs.getOrNull(1)?.toIntOrNull() ?: 1
+                        expanded.add(if (sub == 0) 24 else 4)
+                    }
+                    38, 48 -> {
+                        val mode = subs.getOrNull(1)?.toIntOrNull()
+                        if (mode == 5 && subs.size >= 3) {
+                            val idx = subs[2].toIntOrNull() ?: continue
+                            expanded.add(head)
+                            expanded.add(5)
+                            expanded.add(idx)
+                        } else if (mode == 2) {
+                            // Supports both ISO 8613-6 `38:2:csId:R:G:B` (5+ subparams) and `38:2:R:G:B` (4 subparams)
+                            val rgbStart = if (subs.size >= 6) 3 else 2
+                            val r = subs.getOrNull(rgbStart)?.toIntOrNull() ?: continue
+                            val g = subs.getOrNull(rgbStart + 1)?.toIntOrNull() ?: continue
+                            val b = subs.getOrNull(rgbStart + 2)?.toIntOrNull() ?: continue
+                            expanded.add(head)
+                            expanded.add(2)
+                            expanded.add(r)
+                            expanded.add(g)
+                            expanded.add(b)
+                        }
+                    }
+                    // Other colon subparameters (e.g. 58:2:...) ignored without resetting active style
+                }
+            } else {
+                tok.toIntOrNull()?.let { expanded.add(it) }
+            }
+        }
+        applySgr(expanded)
+    }
+
     private fun applySgr(codes: List<Int>) {
         var i = 0
         while (i < codes.size) {
@@ -509,50 +821,85 @@ class AnsiEmulator(
                 val url = if (sep >= 0) value.substring(sep + 1) else value
                 currentOscLink = url.ifBlank { null }
             }
+            "10" -> {
+                val parts = value.split(';')
+                if (parts.getOrNull(0)?.trim() == "?") {
+                    enqueueResponse("\u001B]10;rgb:e2e2/e8e8/f0f0\u001B\\")
+                }
+                if (parts.getOrNull(1)?.trim() == "?") {
+                    enqueueResponse("\u001B]11;rgb:0707/0b0b/1212\u001B\\")
+                }
+            }
+            "11" -> if (value.trim() == "?") {
+                enqueueResponse("\u001B]11;rgb:0707/0b0b/1212\u001B\\")
+            }
         }
     }
 
     private fun isBlankRow(row: Array<Cell>): Boolean =
-        row.all { it.ch == ' ' && it.style.bgRgb == null && !it.style.inverse }
+        row.all { !it.isWideTrail && it.ch == ' ' && it.style.bgRgb == null && !it.style.inverse }
 
     private fun rowToRenderLine(row: Array<Cell>): TerminalRenderLine {
         var lastCol = row.lastIndex
-        while (lastCol >= 0 && row[lastCol].ch == ' ' && row[lastCol].style.bgRgb == null && !row[lastCol].style.inverse) {
+        while (lastCol >= 0 && !row[lastCol].isWideTrail && row[lastCol].ch == ' ' &&
+            row[lastCol].style.bgRgb == null && !row[lastCol].style.inverse
+        ) {
             lastCol--
         }
         if (lastCol < 0) return TerminalRenderLine(emptyList(), "")
 
-        val sb = StringBuilder(lastCol + 1)
+        val visibleCells = ArrayList<Cell>(lastCol + 1)
         for (c in 0..lastCol) {
-            sb.append(row[c].ch)
+            val cell = row[c]
+            if (!cell.isWideTrail) {
+                visibleCells.add(cell)
+            }
+        }
+        if (visibleCells.isEmpty()) return TerminalRenderLine(emptyList(), "")
+
+        val sb = StringBuilder(visibleCells.size)
+        for (cell in visibleCells) {
+            sb.append(cell.ch)
         }
         val plain = sb.toString()
         val detectedLinks = LinkDetector.extractUrls(plain)
 
-        fun linkAt(col: Int): String? {
-            row[col].oscLink?.let { return it }
-            return detectedLinks.firstOrNull { col in it.startIndex until it.endIndexExclusive }?.url
+        fun linkAt(index: Int): String? {
+            visibleCells[index].oscLink?.let { return it }
+            return detectedLinks.firstOrNull { index in it.startIndex until it.endIndexExclusive }?.url
         }
 
         val spans = mutableListOf<TerminalSpan>()
         var runStart = 0
-        var runStyle = row[0].style
+        var runStyle = visibleCells[0].style
         var runLink = linkAt(0)
-        for (c in 1..lastCol) {
-            val st = row[c].style
-            val lk = linkAt(c)
+        for (idx in 1 until visibleCells.size) {
+            val st = visibleCells[idx].style
+            val lk = linkAt(idx)
             if (st != runStyle || lk != runLink) {
-                spans.add(TerminalSpan(plain.substring(runStart, c), runStyle, runLink))
-                runStart = c
+                spans.add(TerminalSpan(plain.substring(runStart, idx), runStyle, runLink))
+                runStart = idx
                 runStyle = st
                 runLink = lk
             }
         }
-        spans.add(TerminalSpan(plain.substring(runStart, lastCol + 1), runStyle, runLink))
+        spans.add(TerminalSpan(plain.substring(runStart, visibleCells.size), runStyle, runLink))
         return TerminalRenderLine(spans = spans, plainText = plain)
     }
 
     companion object {
+        fun isWideChar(ch: Char): Boolean {
+            val code = ch.code
+            return code in 0x1100..0x115F ||
+                code in 0x2E80..0x303E ||
+                code in 0x3040..0xA4CF ||
+                code in 0xAC00..0xD7A3 ||
+                code in 0xF900..0xFAFF ||
+                code in 0xFE10..0xFE19 ||
+                code in 0xFE30..0xFE6F ||
+                code in 0xFF01..0xFF60 ||
+                code in 0xFFE0..0xFFE6
+        }
         private val ANSI_16_COLORS = intArrayOf(
             0xFF1E293B.toInt(), // Black
             0xFFF87171.toInt(), // Red
