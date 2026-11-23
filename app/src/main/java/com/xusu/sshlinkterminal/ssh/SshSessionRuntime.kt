@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.SystemClock
 import com.jcraft.jsch.ChannelShell
 import com.jcraft.jsch.JSch
+import com.jcraft.jsch.JSchException
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.UIKeyboardInteractive
 import com.jcraft.jsch.UserInfo
@@ -46,6 +47,8 @@ import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+
+private class LocalForwardSetupException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
 data class SessionUiSnapshot(
     val sessionId: String = "",
@@ -121,10 +124,8 @@ class SshSessionController(
     private var userInitiatedStop = false
 
     @Volatile
-    private var hostIdentityBlocked = false
-
-    internal val hostKeyReviewRequired: Boolean
-        get() = hostIdentityBlocked
+    internal var automaticReconnectBlocked = false
+        private set
 
     @Volatile
     private var lastAutoOpenedUrl: String? = null
@@ -181,7 +182,7 @@ class SshSessionController(
         TerminalForegroundService.ensureStarted(context)
         val gen = connectionGen.incrementAndGet()
         userInitiatedStop = false
-        hostIdentityBlocked = false
+        automaticReconnectBlocked = false
         cancelPendingPrompt()
         val previousConnection = connectionJob
         val previousKeepAlive = keepAliveJob
@@ -233,7 +234,7 @@ class SshSessionController(
 
     fun onNetworkAvailable() {
         val state = _snapshot.value.state
-        if (!userInitiatedStop && !hostIdentityBlocked && hostProfile.autoReconnect &&
+        if (!userInitiatedStop && !automaticReconnectBlocked && hostProfile.autoReconnect &&
             (state == SessionState.RECONNECTING || state == SessionState.ERROR || state == SessionState.DISCONNECTED)
         ) {
             repository.appendLog("INFO", "SSH", "${hostProfile.name}: 检测到网络恢复，立即尝试重连")
@@ -319,11 +320,11 @@ class SshSessionController(
 
     fun deployKey(publicKeyLine: String, onResult: (Boolean, String) -> Unit) {
         val cmd = SshKeyManager.buildInstallPublicKeyCommand(publicKeyLine)
-        if (_snapshot.value.state == SessionState.CONNECTED) {
+        if (_snapshot.value.state == SessionState.CONNECTED && shellChannel?.isConnected == true) {
             sendText("$cmd\n")
             onResult(true, "已向当前会话发送公钥写入指令")
         } else {
-            onResult(false, "请先建立 SSH 连接后再一键部署公钥")
+            onResult(false, "请先建立 SSH Shell 会话再一键部署公钥")
         }
     }
 
@@ -346,13 +347,19 @@ class SshSessionController(
                 establishAndStreamSession(currentHost, gen)
                 if (isAttemptActive(gen, currentCoroutineContext().isActive)) {
                     emulator.exitAltScreenIfActive()
-                    unexpectedFailureMessage = "远端会话已关闭 (EOF)"
-                    repository.appendLog("WARN", "SSH", "$label: 远端通道已关闭 (EOF)")
-                    appendSystemLine("\r\n\u001B[33m[远端会话已关闭 (EOF)，连接已断开]\u001B[0m\r\n")
+                    unexpectedFailureMessage = if (currentHost.localForwardSpec.isBlank()) {
+                        "远端会话已关闭 (EOF)"
+                    } else {
+                        "SSH 隧道已断开"
+                    }
+                    repository.appendLog("WARN", "SSH", "$label: $unexpectedFailureMessage")
+                    appendSystemLine("\r\n\u001B[33m[$unexpectedFailureMessage]\u001B[0m\r\n")
                 }
             } catch (e: Exception) {
                 if (isAttemptActive(gen, currentCoroutineContext().isActive)) {
-                    if (e is HostKeyVerificationException) hostIdentityBlocked = true
+                    if (e is HostKeyVerificationException || e is LocalForwardSetupException) {
+                        automaticReconnectBlocked = true
+                    }
                     emulator.exitAltScreenIfActive()
                     unexpectedFailureMessage = e.message ?: e::class.java.simpleName
                     repository.appendLog("WARN", "SSH", "$label: 连接中断 - $unexpectedFailureMessage")
@@ -365,7 +372,7 @@ class SshSessionController(
             }
 
             if (!isAttemptActive(gen, currentCoroutineContext().isActive) ||
-                !currentHost.autoReconnect || hostIdentityBlocked
+                !currentHost.autoReconnect || automaticReconnectBlocked
             ) {
                 if (!userInitiatedStop && connectionGen.get() == gen && currentCoroutineContext().isActive) {
                     _snapshot.update {
@@ -402,6 +409,9 @@ class SshSessionController(
     }
 
     private suspend fun establishAndStreamSession(host: HostProfile, gen: Long) = withContext(Dispatchers.IO) {
+        val localForward = host.localForwardSpec.takeIf { it.isNotBlank() }?.let {
+            LocalPortForward.parse(it) ?: throw LocalForwardSetupException("本地端口转发格式无效，请编辑主机配置")
+        }
         emulator.exitAltScreenIfActive()
         emulator.resetParserState()
         val jsch = JSch()
@@ -427,6 +437,7 @@ class SshSessionController(
         session.setSocketFactory(rttFactory)
         var channel: ChannelShell? = null
         var outStream: OutputStream? = null
+        var forwardRegistered = false
         try {
             jschSession = session
             session.setConfig("StrictHostKeyChecking", "yes")
@@ -458,23 +469,38 @@ class SshSessionController(
             session.connect(90_000)
             if (!isAttemptActive(gen, currentCoroutineContext().isActive)) return@withContext
 
-            channel = session.openChannel("shell") as ChannelShell
-            shellChannel = channel
-            channel.setPty(true)
-            channel.setPtyType("xterm-256color")
-            channel.setPtySize(lastCols, lastRows, 0, 0)
-
-            val inStream = channel.inputStream
-            outStream = channel.outputStream
-            shellOut = outStream
-            channel.connect(15_000)
+            val inStream = if (localForward == null) {
+                val shell = session.openChannel("shell") as ChannelShell
+                channel = shell
+                shellChannel = shell
+                shell.setPty(true)
+                shell.setPtyType("xterm-256color")
+                shell.setPtySize(lastCols, lastRows, 0, 0)
+                val input = shell.inputStream
+                outStream = shell.outputStream
+                shellOut = outStream
+                shell.connect(15_000)
+                input
+            } else {
+                try {
+                    session.setPortForwardingL(
+                        "127.0.0.1", localForward.localPort, localForward.destinationHost, localForward.destinationPort
+                    )
+                    forwardRegistered = true
+                } catch (e: JSchException) {
+                    throw LocalForwardSetupException("无法监听手机 ${localForward.localAddress}：${e.message}", e)
+                }
+                null
+            }
             if (!isAttemptActive(gen, currentCoroutineContext().isActive)) return@withContext
 
+            val connectedChannel = channel
+            val onlineLabel = localForward?.let { "转发中 · ${it.localAddress}" } ?: "在线"
             val connectedAt = System.currentTimeMillis()
             _snapshot.update {
                 it.copy(
                     state = SessionState.CONNECTED,
-                    statusDetail = "在线 · 心跳 ${aliveSec}s",
+                    statusDetail = "$onlineLabel · 心跳 ${aliveSec}s",
                     connectedSinceMillis = connectedAt,
                     reconnectAttempts = 0,
                     pendingInteractivePrompt = null
@@ -482,16 +508,19 @@ class SshSessionController(
             }
             val label = sessionLabel(host)
             repository.appendLog("INFO", "SSH", "$label: SSH 会话已建立")
+            if (localForward != null) {
+                appendSystemLine("\r\n[本地转发已开启：手机 ${localForward.localAddress} → SSH 目标 ${localForward.destinationHost}:${localForward.destinationPort}]\r\n")
+            }
 
             // Start heartbeat RTT probe at a gentle cadence to populate chart telemetry without flooding idle sockets.
             keepAliveJob?.cancel()
             val probeIntervalMs = maxOf(aliveSec, 30) * 1000L
             keepAliveJob = scope.launch {
                 var firstProbe = true
-                while (isActive && session.isConnected && channel.isConnected && connectionGen.get() == gen) {
+                while (isActive && session.isConnected && connectedChannel?.isConnected != false && connectionGen.get() == gen) {
                     delay(if (firstProbe) 1_500L else probeIntervalMs)
                     firstProbe = false
-                    if (!session.isConnected || !channel.isConnected || connectionGen.get() != gen) break
+                    if (!session.isConnected || connectedChannel?.isConnected == false || connectionGen.get() != gen) break
                     try {
                         // sendKeepAliveMsg() returns right after the local socket write, so measure the time
                         // until the server's reply actually arrives on the wire (real network RTT).
@@ -508,7 +537,7 @@ class SshSessionController(
                             _snapshot.update {
                                 it.copy(
                                     lastRttMs = rtt,
-                                    statusDetail = "在线 · ${rtt}ms"
+                                    statusDetail = "$onlineLabel · ${rtt}ms"
                                 )
                             }
                             repository.appendRttSample(rttMs = rtt, activeSessions = 1)
@@ -523,13 +552,20 @@ class SshSessionController(
             }
 
             // Execute optional auto-attach command (e.g., tmux attach)
-            if (host.autoAttachCommand.isNotBlank()) {
+            if (connectedChannel != null && host.autoAttachCommand.isNotBlank()) {
                 scope.launch {
                     delay(280)
-                    if (channel.isConnected && connectionGen.get() == gen) {
+                    if (connectedChannel.isConnected && connectionGen.get() == gen) {
                         sendText(host.autoAttachCommand.trim() + "\n")
                     }
                 }
+            }
+
+            if (inStream == null) {
+                while (isAttemptActive(gen, currentCoroutineContext().isActive) && session.isConnected) {
+                    delay(500)
+                }
+                return@withContext
             }
 
             val buffer = ByteArray(8192)
@@ -555,6 +591,13 @@ class SshSessionController(
                 refreshTerminalSnapshot()
             }
         } finally {
+            if (forwardRegistered && localForward != null) {
+                try {
+                    session.delPortForwardingL(localForward.localPort)
+                } catch (_: JSchException) {
+                    // JSch may already have removed the listener while disconnecting the transport.
+                }
+            }
             try {
                 channel?.disconnect()
             } catch (_: Throwable) {
@@ -1024,7 +1067,7 @@ class SshSessionManager(
         val list = synchronized(managerLock) { controllers.values.toList() }
         list.forEach { controller ->
             val state = controller.snapshot.value.state
-            if (shouldReconnectOnAction(state, controller.hostProfile.pinInDaemon, controller.hostKeyReviewRequired)) {
+            if (shouldReconnectOnAction(state, controller.hostProfile.pinInDaemon, controller.automaticReconnectBlocked)) {
                 controller.connect(forceRestart = state == SessionState.RECONNECTING)
             }
         }
@@ -1040,7 +1083,7 @@ class SshSessionManager(
                 if (shouldNotifyRevive) {
                     controller.appendNoticeOnce("\r\n\u001B[33m$reviveReason\u001B[0m\r\n")
                 }
-                if (!controller.hostKeyReviewRequired) controller.connect()
+                if (!controller.automaticReconnectBlocked) controller.connect()
             }
     }
 
@@ -1090,8 +1133,8 @@ class SshSessionManager(
         internal fun shouldReconnectOnAction(
             state: SessionState,
             pinInDaemon: Boolean,
-            hostKeyReviewRequired: Boolean = false
-        ): Boolean = !hostKeyReviewRequired && when (state) {
+            automaticReconnectBlocked: Boolean = false
+        ): Boolean = !automaticReconnectBlocked && when (state) {
             SessionState.CONNECTED,
             SessionState.CONNECTING,
             SessionState.AWAITING_INPUT,

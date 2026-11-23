@@ -1,5 +1,6 @@
 package com.xusu.sshlinkterminal.ui.screens
 
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.BorderStroke
@@ -75,6 +76,7 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -88,6 +90,7 @@ import com.xusu.sshlinkterminal.data.ChartWindowRule
 import com.xusu.sshlinkterminal.data.ColorBag
 import com.xusu.sshlinkterminal.data.GuardStatus
 import com.xusu.sshlinkterminal.data.HostProfile
+import com.xusu.sshlinkterminal.ssh.LocalPortForward
 import com.xusu.sshlinkterminal.data.RttSample
 import com.xusu.sshlinkterminal.data.SessionState
 import com.xusu.sshlinkterminal.data.SshKeyRecord
@@ -652,6 +655,21 @@ private fun HostProfileCard(
     }
 }
 
+private data class HostEditorFields(
+    val name: String,
+    val host: String,
+    val portText: String,
+    val username: String,
+    val authType: AuthType,
+    val selectedKeyId: String?,
+    val autoAttach: String,
+    val localForwardSpec: String,
+    val keepAliveSec: String,
+    val autoReconnect: Boolean,
+    val pinInDaemon: Boolean,
+    val tag: String
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HostEditorDialog(
@@ -662,30 +680,48 @@ fun HostEditorDialog(
     onDismiss: () -> Unit,
     onSave: (HostProfile) -> Unit
 ) {
-    var name by remember { mutableStateOf(initial?.name ?: "") }
-    var host by remember { mutableStateOf(initial?.host ?: "") }
-    var portText by remember { mutableStateOf((initial?.port ?: 22).toString()) }
-    var username by remember { mutableStateOf(initial?.username ?: "root") }
-    var authType by remember { mutableStateOf(initial?.authType ?: AuthType.PASSWORD) }
-    var password by remember { mutableStateOf(VaultCrypto.decrypt(initial?.encryptedPassword)) }
-    var selectedKeyId by remember { mutableStateOf(initial?.keyId ?: keys.firstOrNull()?.id) }
-    var autoAttach by remember { mutableStateOf(initial?.autoAttachCommand ?: "") }
-    var keepAliveSec by remember { mutableStateOf((initial?.keepAliveIntervalSec ?: 15).toString()) }
-    var autoReconnect by remember { mutableStateOf(initial?.autoReconnect ?: true) }
-    var pinInDaemon by remember { mutableStateOf(initial?.pinInDaemon ?: true) }
-    var tag by remember { mutableStateOf(initial?.tag ?: "LAN") }
+    val context = LocalContext.current
+    val originalFields = remember {
+        HostEditorFields(
+            name = initial?.name.orEmpty(),
+            host = initial?.host.orEmpty(),
+            portText = (initial?.port ?: 22).toString(),
+            username = initial?.username ?: "root",
+            authType = initial?.authType ?: AuthType.PASSWORD,
+            selectedKeyId = initial?.keyId ?: keys.firstOrNull()?.id,
+            autoAttach = initial?.autoAttachCommand.orEmpty(),
+            localForwardSpec = initial?.localForwardSpec.orEmpty(),
+            keepAliveSec = (initial?.keepAliveIntervalSec ?: 15).toString(),
+            autoReconnect = initial?.autoReconnect ?: true,
+            pinInDaemon = initial?.pinInDaemon ?: true,
+            tag = initial?.tag ?: "LAN"
+        )
+    }
+    var fields by remember { mutableStateOf(originalFields) }
+    val originalPassword = remember { VaultCrypto.decrypt(initial?.encryptedPassword) }
+    var password by remember { mutableStateOf(originalPassword) }
     var keyMenuExpanded by remember { mutableStateOf(false) }
     var hostKeyRevision by remember { mutableStateOf(0) }
     var forgettingHostKey by remember { mutableStateOf<Pair<String, Int>?>(null) }
+    val host = fields.host
+    val portText = fields.portText
     var hostKeyActionError by remember(host, portText) { mutableStateOf<String?>(null) }
     val enteredPort = portText.toIntOrNull()
     val validEndpoint = host.isNotBlank() && enteredPort != null && enteredPort in 1..65535
+    val forwardingOnly = fields.localForwardSpec.isNotBlank()
+    val invalidForward = forwardingOnly && LocalPortForward.parse(fields.localForwardSpec) == null
     val savedHostKey = remember(host, portText, hostKeyRevision) {
         if (validEndpoint) onReadHostKey(host, enteredPort) else Result.success(null)
     }
+    val dismissEditor = {
+        if (fields != originalFields || password != originalPassword) {
+            Toast.makeText(context, "修改未保存", Toast.LENGTH_SHORT).show()
+        }
+        onDismiss()
+    }
 
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = dismissEditor,
         title = { Text(if (initial == null) "新建 SSH 主机" else "编辑 SSH 主机") },
         text = {
             Column(
@@ -695,8 +731,8 @@ fun HostEditorDialog(
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedTextField(
-                    value = name,
-                    onValueChange = { name = it },
+                    value = fields.name,
+                    onValueChange = { fields = fields.copy(name = it) },
                     label = { Text("别名（如：家用服务器）") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
@@ -704,14 +740,14 @@ fun HostEditorDialog(
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
                         value = host,
-                        onValueChange = { host = it },
+                        onValueChange = { fields = fields.copy(host = it) },
                         label = { Text("主机 IP / Tailscale 域名") },
                         singleLine = true,
                         modifier = Modifier.weight(2f)
                     )
                     OutlinedTextField(
                         value = portText,
-                        onValueChange = { portText = it.filter(Char::isDigit) },
+                        onValueChange = { fields = fields.copy(portText = it.filter(Char::isDigit)) },
                         label = { Text("端口") },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
@@ -719,8 +755,8 @@ fun HostEditorDialog(
                     )
                 }
                 OutlinedTextField(
-                    value = username,
-                    onValueChange = { username = it },
+                    value = fields.username,
+                    onValueChange = { fields = fields.copy(username = it) },
                     label = { Text("用户名") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
@@ -752,8 +788,8 @@ fun HostEditorDialog(
                 ) {
                     listOf("LAN", "Tailscale", "Prod", "Lab").forEach { option ->
                         FilterChip(
-                            selected = tag == option,
-                            onClick = { tag = option },
+                            selected = fields.tag == option,
+                            onClick = { fields = fields.copy(tag = option) },
                             label = { Text(option) }
                         )
                     }
@@ -765,23 +801,23 @@ fun HostEditorDialog(
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     FilterChip(
-                        selected = authType == AuthType.PASSWORD,
-                        onClick = { authType = AuthType.PASSWORD },
+                        selected = fields.authType == AuthType.PASSWORD,
+                        onClick = { fields = fields.copy(authType = AuthType.PASSWORD) },
                         label = { Text("加密保存密码") }
                     )
                     FilterChip(
-                        selected = authType == AuthType.PUBLIC_KEY,
-                        onClick = { authType = AuthType.PUBLIC_KEY },
+                        selected = fields.authType == AuthType.PUBLIC_KEY,
+                        onClick = { fields = fields.copy(authType = AuthType.PUBLIC_KEY) },
                         label = { Text("SSH 私钥") }
                     )
                     FilterChip(
-                        selected = authType == AuthType.INTERACTIVE_OR_TAILSCALE,
-                        onClick = { authType = AuthType.INTERACTIVE_OR_TAILSCALE },
+                        selected = fields.authType == AuthType.INTERACTIVE_OR_TAILSCALE,
+                        onClick = { fields = fields.copy(authType = AuthType.INTERACTIVE_OR_TAILSCALE) },
                         label = { Text("Tailscale / 交互") }
                     )
                 }
 
-                if (authType != AuthType.PUBLIC_KEY) {
+                if (fields.authType != AuthType.PUBLIC_KEY) {
                     OutlinedTextField(
                         value = password,
                         onValueChange = { password = it },
@@ -792,7 +828,7 @@ fun HostEditorDialog(
                     )
                 }
 
-                if (authType == AuthType.PUBLIC_KEY) {
+                if (fields.authType == AuthType.PUBLIC_KEY) {
                     if (keys.isEmpty()) {
                         Text(
                             "尚未创建密钥，请先在侧栏「SSH 密钥库」生成 Ed25519 密钥",
@@ -804,7 +840,7 @@ fun HostEditorDialog(
                             expanded = keyMenuExpanded,
                             onExpandedChange = { keyMenuExpanded = !keyMenuExpanded }
                         ) {
-                            val selectedName = keys.firstOrNull { it.id == selectedKeyId }?.name ?: "选择私钥"
+                            val selectedName = keys.firstOrNull { it.id == fields.selectedKeyId }?.name ?: "选择私钥"
                             OutlinedTextField(
                                 value = selectedName,
                                 onValueChange = {},
@@ -823,7 +859,7 @@ fun HostEditorDialog(
                                     DropdownMenuItem(
                                         text = { Text("${key.name} (${key.algorithm})") },
                                         onClick = {
-                                            selectedKeyId = key.id
+                                            fields = fields.copy(selectedKeyId = key.id)
                                             keyMenuExpanded = false
                                         }
                                     )
@@ -834,41 +870,57 @@ fun HostEditorDialog(
                 }
 
                 OutlinedTextField(
-                    value = autoAttach,
-                    onValueChange = { autoAttach = it },
+                    value = fields.localForwardSpec,
+                    onValueChange = { fields = fields.copy(localForwardSpec = it) },
+                    label = { Text("本地端口转发（可选）") },
+                    placeholder = { Text("18765:127.0.0.1:8765") },
+                    supportingText = {
+                        Text(if (invalidForward) "格式为手机端口:目标地址:目标端口，手机端口须为 1024–65535"
+                        else "填写后仅转发端口，重新连接后生效")
+                    },
+                    isError = invalidForward,
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = fields.autoAttach,
+                    onValueChange = { fields = fields.copy(autoAttach = it) },
                     label = { Text("登录后自动附着命令（可选）") },
                     placeholder = { Text("留空则直接进入默认 Shell；Linux 可填 tmux") },
+                    enabled = !forwardingOnly,
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     FilterChip(
-                        selected = autoAttach.trim() == "tmux new-session -A -s main",
-                        onClick = { autoAttach = "tmux new-session -A -s main" },
+                        selected = fields.autoAttach.trim() == "tmux new-session -A -s main",
+                        onClick = { fields = fields.copy(autoAttach = "tmux new-session -A -s main") },
+                        enabled = !forwardingOnly,
                         label = { Text("填入 Linux tmux") }
                     )
-                    if (autoAttach.isNotEmpty()) {
+                    if (fields.autoAttach.isNotEmpty()) {
                         FilterChip(
                             selected = false,
-                            onClick = { autoAttach = "" },
+                            onClick = { fields = fields.copy(autoAttach = "") },
+                            enabled = !forwardingOnly,
                             label = { Text("清空") }
                         )
                     }
                 }
                 OutlinedTextField(
-                    value = keepAliveSec,
-                    onValueChange = { keepAliveSec = it.filter(Char::isDigit) },
+                    value = fields.keepAliveSec,
+                    onValueChange = { fields = fields.copy(keepAliveSec = it.filter(Char::isDigit)) },
                     label = { Text("KeepAlive 心跳间隔 (秒)") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.fillMaxWidth()
                 )
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = autoReconnect, onCheckedChange = { autoReconnect = it })
+                    Checkbox(checked = fields.autoReconnect, onCheckedChange = { fields = fields.copy(autoReconnect = it) })
                     Text("断线/切网自动重连", style = MaterialTheme.typography.bodySmall)
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = pinInDaemon, onCheckedChange = { pinInDaemon = it })
+                    Checkbox(checked = fields.pinInDaemon, onCheckedChange = { fields = fields.copy(pinInDaemon = it) })
                     Text("在守护进程/开机恢复时常驻保活", style = MaterialTheme.typography.bodySmall)
                 }
             }
@@ -876,29 +928,30 @@ fun HostEditorDialog(
         confirmButton = {
             ButtonTextAction(
                 text = "保存",
-                enabled = host.isNotBlank() && username.isNotBlank(),
+                enabled = host.isNotBlank() && fields.username.isNotBlank() && !invalidForward,
                 onClick = {
                     val finalProfile = HostProfile(
                         id = initial?.id ?: java.util.UUID.randomUUID().toString(),
-                        name = name.trim().ifBlank { host.trim() },
+                        name = fields.name.trim().ifBlank { host.trim() },
                         host = host.trim(),
                         port = (portText.toIntOrNull() ?: 22).coerceIn(1, 65535),
-                        username = username.trim(),
-                        authType = authType,
+                        username = fields.username.trim(),
+                        authType = fields.authType,
                         encryptedPassword = password.takeIf { it.isNotEmpty() }?.let { VaultCrypto.encrypt(it) },
-                        keyId = if (authType == AuthType.PUBLIC_KEY) selectedKeyId else initial?.keyId,
-                        autoAttachCommand = autoAttach.trim(),
-                        keepAliveIntervalSec = (keepAliveSec.toIntOrNull() ?: 15).coerceIn(5, 120),
-                        autoReconnect = autoReconnect,
-                        pinInDaemon = pinInDaemon,
-                        tag = tag
+                        keyId = if (fields.authType == AuthType.PUBLIC_KEY) fields.selectedKeyId else initial?.keyId,
+                        autoAttachCommand = fields.autoAttach.trim(),
+                        keepAliveIntervalSec = (fields.keepAliveSec.toIntOrNull() ?: 15).coerceIn(5, 120),
+                        autoReconnect = fields.autoReconnect,
+                        pinInDaemon = fields.pinInDaemon,
+                        tag = fields.tag,
+                        localForwardSpec = fields.localForwardSpec.trim()
                     )
                     onSave(finalProfile)
                 }
             )
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("取消") }
+            TextButton(onClick = dismissEditor) { Text("取消") }
         }
     )
 

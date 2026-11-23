@@ -47,7 +47,8 @@ data class HostProfile(
     val keepAliveIntervalSec: Int = 15,
     val autoReconnect: Boolean = true,
     val pinInDaemon: Boolean = true,
-    val tag: String = "LAN"
+    val tag: String = "LAN",
+    val localForwardSpec: String = ""
 )
 
 data class SshKeyRecord(

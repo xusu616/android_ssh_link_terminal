@@ -162,7 +162,8 @@ class AppRepository(context: Context) {
                     keepAliveIntervalSec = obj.optInt("keepAliveIntervalSec", 15),
                     autoReconnect = obj.optBoolean("autoReconnect", true),
                     pinInDaemon = obj.optBoolean("pinInDaemon", true),
-                    tag = obj.optString("tag", "LAN")
+                    tag = obj.optString("tag", "LAN"),
+                    localForwardSpec = obj.optString("localForwardSpec", "")
                 )
             }
             if (!prefs.getBoolean(KEY_MIGRATED_LEGACY_TMUX_V1, false)) {
@@ -206,6 +207,7 @@ class AppRepository(context: Context) {
                 put("autoReconnect", host.autoReconnect)
                 put("pinInDaemon", host.pinInDaemon)
                 put("tag", host.tag)
+                put("localForwardSpec", host.localForwardSpec)
             })
         }
         prefs.edit { putString(KEY_HOSTS, arr.toString()) }

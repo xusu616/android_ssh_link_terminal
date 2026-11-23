@@ -32,10 +32,10 @@ class SshSessionManagerPolicyTest {
     }
 
     @Test
-    fun `host identity rejection stops automatic reconnect in every state`() {
+    fun `a failure requiring user action blocks automatic reconnect in every state`() {
         SessionState.entries.forEach { state ->
-            assertFalse(SshSessionManager.shouldReconnectOnAction(state, pinInDaemon = true, hostKeyReviewRequired = true))
-            assertFalse(SshSessionManager.shouldReconnectOnAction(state, pinInDaemon = false, hostKeyReviewRequired = true))
+            assertFalse(SshSessionManager.shouldReconnectOnAction(state, pinInDaemon = true, automaticReconnectBlocked = true))
+            assertFalse(SshSessionManager.shouldReconnectOnAction(state, pinInDaemon = false, automaticReconnectBlocked = true))
         }
     }
 
